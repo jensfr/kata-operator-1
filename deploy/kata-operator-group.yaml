@@ -1,0 +1,8 @@
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: kata-operator-group
+  namespace: kata-operator 
+spec:
+  targetNamespaces:
+  - kata-operator 

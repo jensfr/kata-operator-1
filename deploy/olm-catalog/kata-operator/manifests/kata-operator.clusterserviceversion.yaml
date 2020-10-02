@@ -1,0 +1,216 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  annotations:
+    operatorframework.io/suggested-namespace: kata-operator 
+    alm-examples: |-
+      [
+        {
+          "apiVersion": "kataconfiguration.openshift.io/v1alpha1",
+          "kind": "KataConfig",
+          "metadata": {
+            "name": "example-kataconfig"
+          }
+        },
+        {
+          "apiVersion": "kataconfiguration.openshift.io/v1alpha1",
+          "kind": "KataConfig",
+          "metadata": {
+            "name": "example-kataconfig"
+          },
+          "spec": {
+            "config": {
+              "sourceImage": "docker.io/katadocker/kata-deploy:latest"
+            }
+          }
+        }
+      ]
+    capabilities: Basic Install
+  name: kata-operator.v0.0.1
+  namespace: kata-operator 
+spec:
+  apiservicedefinitions: {}
+  customresourcedefinitions:
+    owned:
+    - description: KataConfig is the Schema for the kataconfigs API
+      kind: KataConfig
+      name: kataconfigs.kataconfiguration.openshift.io
+      version: v1alpha1
+  description: Manages the Kata runtime installation in the cluster
+  displayName: Kata Operator
+  icon:
+  - base64data: ""
+    mediatype: ""
+  install:
+    spec:
+      clusterPermissions:
+      - rules:
+        - apiGroups:
+          - config.openshift.io
+          resources:
+          - clusterversions
+          verbs:
+          - get
+        - apiGroups:
+          - ""
+          - machineconfiguration.openshift.io
+          resources:
+          - nodes
+          - machineconfigs
+          - machineconfigpools
+          - pods
+          - services
+          - services/finalizers
+          - endpoints
+          - persistentvolumeclaims
+          - events
+          - configmaps
+          - secrets
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
+          - node.k8s.io
+          resources:
+          - runtimeclasses
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
+          - apps
+          resources:
+          - deployments
+          - daemonsets
+          - replicasets
+          - statefulsets
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
+          - monitoring.coreos.com
+          resources:
+          - servicemonitors
+          verbs:
+          - get
+          - create
+        - apiGroups:
+          - apps
+          resourceNames:
+          - kata-operator
+          resources:
+          - deployments/finalizers
+          verbs:
+          - update
+        - apiGroups:
+          - ""
+          resources:
+          - pods
+          verbs:
+          - get
+        - apiGroups:
+          - apps
+          resources:
+          - replicasets
+          - deployments
+          verbs:
+          - get
+        - apiGroups:
+          - kataconfiguration.openshift.io
+          resources:
+          - '*'
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        serviceAccountName: kata-operator
+      deployments:
+      - name: kata-operator
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              name: kata-operator
+          strategy: {}
+          template:
+            metadata:
+              labels:
+                name: kata-operator
+            spec:
+              containers:
+              - command:
+                - kata-operator
+                env:
+                - name: WATCH_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.annotations['olm.targetNamespaces']
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: OPERATOR_NAME
+                  value: kata-operator
+                image: quay.io/isolatedcontainers/kata-operator:latest
+                imagePullPolicy: Always
+                name: kata-operator
+                resources: {}
+              nodeSelector:
+                node-role.kubernetes.io/master: ""
+              serviceAccountName: kata-operator
+              tolerations:
+              - effect: NoSchedule
+                key: node-role.kubernetes.io/master
+                operator: Exists
+              - effect: NoExecute
+                key: node.kubernetes.io/unreachable
+                operator: Exists
+                tolerationSeconds: 120
+              - effect: NoExecute
+                key: node.kubernetes.io/not-ready
+                operator: Exists
+                tolerationSeconds: 120
+              - effect: NoSchedule
+                key: node.kubernetes.io/memory-pressure
+                operator: Exists
+    strategy: deployment
+  installModes:
+  - supported: true
+    type: OwnNamespace
+  - supported: true
+    type: SingleNamespace
+  - supported: false
+    type: MultiNamespace
+  - supported: true
+    type: AllNamespaces
+  keywords:
+  - kata
+  links:
+  - name: Kata Operator
+    url: https://kata-operator.domain
+  maintainers:
+  - email: jfreimann@redhat.com
+    name: Jens
+  maturity: alpha
+  provider:
+    name: Red Hat
+    url: github.com/openshift/kata-operator/
+  version: 0.0.1
