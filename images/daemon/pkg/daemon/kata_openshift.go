@@ -442,7 +442,7 @@ func installRPMs(k *KataOpenShift) (err error) {
 		return err
 	}
 	err = image.CreateRuntimeBundleLayout("/opt/kata-install/kata-image/",
-		"/usr/local/kata", "latest", "linux", []string{"name=latest"})
+		"/usr/local/kata", ".", "linux", []string{"platform.os=linux"})
 	if err != nil {
 		fmt.Println("error creating Runtime bundle layout in /usr/local/kata")
 		return err
@@ -454,14 +454,14 @@ func installRPMs(k *KataOpenShift) (err error) {
 		return err
 	}
 
-	cmd = exec.Command("/usr/bin/cp", "-f", "/usr/local/kata/latest/packages.repo",
+	cmd = exec.Command("/usr/bin/cp", "-f", "/usr/local/kata/packages.repo",
 		"/etc/yum.repos.d/")
 	if err := doCmd(cmd); err != nil {
 		return err
 	}
 
 	cmd = exec.Command("/usr/bin/cp", "-a",
-		"/usr/local/kata/latest/packages", "/opt/kata-install/packages")
+		"/usr/local/kata/packages", "/opt/kata-install/packages")
 	if err = doCmd(cmd); err != nil {
 		return err
 	}
