@@ -5,7 +5,7 @@ go 1.13
 require (
 	github.com/containers/image/v5 v5.5.1
 	github.com/coreos/go-semver v0.3.0
-	github.com/dsnet/compress v0.0.1 // indirect
+	//github.com/dsnet/compress v0.0.1 // indirect
 	github.com/opencontainers/image-tools v1.0.0-rc1.0.20190306063041-93db3b16e673
 	github.com/openshift/client-go v0.0.0-20200827190008-3062137373b5
 	github.com/openshift/kata-operator v0.0.0-20201106123035-a3bf549cd866
