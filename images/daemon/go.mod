@@ -1,4 +1,4 @@
-module github.com/openshift/kata-operator-daemon
+module github.com/openshift/kata-operator/
 
 go 1.13
 

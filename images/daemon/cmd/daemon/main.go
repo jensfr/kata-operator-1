@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	kataDaemon "github.com/openshift/kata-operator-daemon/pkg/daemon"
+	kataDaemon "github.com/openshift/kata-operator/images/daemon/pkg/daemon"
 	kataTypes "github.com/openshift/kata-operator/api/v1"
 	mcfgapi "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io"
 	"k8s.io/apimachinery/pkg/runtime"
