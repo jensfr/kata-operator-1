@@ -216,7 +216,7 @@ WantedBy=multi-user.target
 				"machineconfiguration.openshift.io/role": machinePool,
 				"app":                                    r.kataConfig.Name,
 			},
-			Namespace: "sandboxed-containers-operator",
+			Namespace: "openshift-sandboxed-containers-system",
 		},
 		Spec: mcfgv1.MachineConfigSpec{
 			Extensions: []string{"sandboxed-containers"},
