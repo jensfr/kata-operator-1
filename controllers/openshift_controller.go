@@ -116,10 +116,16 @@ func (r *KataConfigOpenShiftReconciler) Reconcile(req ctrl.Request) (ctrl.Result
 		ds := r.processDaemonsetForMonitor()
 		// Set KataConfig instance as the owner and controller
 		if ds != nil {
-			if err := controllerutil.SetControllerReference(r.kataConfig, ds, r.Scheme); err != nil {
-				return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
+			r.Log.Info("daemonset is not nil")
+			myErr := controllerutil.SetControllerReference(r.kataConfig, ds, r.Scheme)
+			if myErr != nil {
+				r.Log.Info("setcontrollerreference successful, reconciling")
+				//return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
+			} else {
+				r.Log.Error(myErr, "setcontrollerreference failed")
 			}
 		} else {
+			r.Log.Info("ds returned was nil")
 			return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, nil
 		}
 		foundDs := &appsv1.DaemonSet{}
@@ -128,11 +134,11 @@ func (r *KataConfigOpenShiftReconciler) Reconcile(req ctrl.Request) (ctrl.Result
 			r.Log.Info("Creating a new installation monitor daemonset", "ds.Namespace", ds.Namespace, "ds.Name", ds.Name)
 			err = r.Client.Create(context.TODO(), ds)
 			if err != nil {
-				r.Log.Error(err, "other error in creating monitor daemonset")
+				r.Log.Error(err, "error when creating monitor daemonset")
 				res = ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}
 			}
 		} else if err != nil {
-			r.Log.Info("error getting monitor daemonset, %s", err)
+			r.Log.Info("could not get monitor daemonset, try again", err)
 			res = ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}
 		}
 
@@ -147,9 +153,10 @@ func (r *KataConfigOpenShiftReconciler) processDaemonsetForMonitor() *appsv1.Dae
 	)
 
 	if monitorImage == "" {
-		return nil
+		r.Log.Info("OSC_MONITOR_IMAGE is not set, using default image")
+		monitorImage = "quay.io/jfedora/fedora:34"
 	}
-	dsName := "sandboxed-containers-monitor-daemon"
+	dsName := "openshift-sandboxed-containers-monitor"
 	dsLabels := map[string]string{
 		"name": dsName,
 	}
@@ -185,7 +192,7 @@ func (r *KataConfigOpenShiftReconciler) processDaemonsetForMonitor() *appsv1.Dae
 					NodeSelector:       nodeSelector,
 					Containers: []corev1.Container{
 						{
-							Name:            "openshift-sandboxed-containers-monitor",
+							Name:            "kata-monitor",
 							Image:           monitorImage,
 							ImagePullPolicy: "Always",
 							SecurityContext: &corev1.SecurityContext{
@@ -526,8 +533,10 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 15}, nil
 	}
 	err = r.Client.Delete(context.TODO(), ds)
-	if err != nil {
-		r.Log.Error(err, "error deleting monitor Daemonset")
+	if err != nil && k8serrors.IsNotFound(err) {
+		r.Log.Info("monitor daemonset was already deleted")
+	} else {
+		r.Log.Error(err, "error when deleting monitor Daemonset")
 		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 15}, err
 	}
 
