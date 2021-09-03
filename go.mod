@@ -1,6 +1,6 @@
 module github.com/openshift/sandboxed-containers-operator
 
-go 1.13
+go 1.16
 
 require (
 	github.com/ajeddeloh/go-json v0.0.0-20200220154158-5ae607161559 // indirect
