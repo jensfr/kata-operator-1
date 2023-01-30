@@ -1,0 +1,34 @@
+# Copyright Confidential Containers Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Builds pod vm image inside container
+#
+ARG BUILDER_IMG="quay.io/confidential-containers/podvm-builder-ubuntu"
+
+FROM ${BUILDER_IMG} AS podvm_builder
+
+ARG CLOUD_PROVIDER=libvirt
+ARG PODVM_DISTRO=ubuntu
+
+ENV CLOUD_PROVIDER ${CLOUD_PROVIDER}
+ENV PODVM_DISTRO ${PODVM_DISTRO}
+
+# Default to Ubuntu Focal amd64 image. These variables can be overriden as needed
+ARG UBUNTU_IMAGE_URL=https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
+ARG UBUNTU_IMAGE_CHECKSUM=3895e38566e5c2c019f5c6f825ab7570ee34dac6b9142fab0c7e5a78084c4280
+
+ENV UBUNTU_IMAGE_URL ${UBUNTU_IMAGE_URL}
+ENV UBUNTU_IMAGE_CHECKSUM ${UBUNTU_IMAGE_CHECKSUM}
+
+
+# Building binaries separately allows for reuse in case of error
+# with image building step
+RUN cd cloud-api-adaptor/podvm && \
+     CLOUD_PROVIDER=$CLOUD_PROVIDER make binaries
+
+RUN cd cloud-api-adaptor/podvm && \
+     CLOUD_PROVIDER=$CLOUD_PROVIDER PODVM_DISTRO=$PODVM_DISTRO make image
+
+FROM scratch
+COPY --from=podvm_builder /src/cloud-api-adaptor/podvm/output/*.qcow2 / 
