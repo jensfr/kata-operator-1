@@ -21,6 +21,42 @@ import (
 
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
+// DeploymentMode specifies how kata containers should be deployed
+type DeploymentMode string
+
+const (
+	// DeploymentModeMachineConfig uses MCO for deployment (traditional OpenShift)
+	DeploymentModeMachineConfig DeploymentMode = "MachineConfig"
+	// DeploymentModeDaemonSet uses DaemonSet for deployment (HCP, managed services)
+	DeploymentModeDaemonSet DeploymentMode = "DaemonSet"
+	// DeploymentModeAuto automatically detects the best mode based on cluster type
+	DeploymentModeAuto DeploymentMode = "Auto"
+)
+
+// HostComponentPaths allows specifying paths to host-installed components
+// This is used when QEMU, virtiofsd, or kernel are installed via rpm-ostree
+type HostComponentPaths struct {
+	// QemuPath is the path to the QEMU binary on the host
+	// +optional
+	QemuPath string `json:"qemuPath,omitempty"`
+	// VirtiofsdPath is the path to virtiofsd on the host
+	// +optional
+	VirtiofsdPath string `json:"virtiofsdPath,omitempty"`
+	// KernelPath is the path to the kernel on the host
+	// +optional
+	KernelPath string `json:"kernelPath,omitempty"`
+}
+
+// InitrdConfig specifies how the initrd should be provisioned
+type InitrdConfig struct {
+	// BuildAtRuntime specifies whether to build initrd at runtime
+	// +optional
+	BuildAtRuntime *bool `json:"buildAtRuntime,omitempty"`
+	// PrebuiltPath is the path to a prebuilt initrd
+	// +optional
+	PrebuiltPath string `json:"prebuiltPath,omitempty"`
+}
+
 // KataConfigSpec defines the desired state of KataConfig
 type KataConfigSpec struct {
 	// KataConfigPoolSelector is used to filter the worker nodes
@@ -44,6 +80,47 @@ type KataConfigSpec struct {
 	// +optional
 	// +kubebuilder:default:=false
 	EnablePeerPods bool `json:"enablePeerPods"`
+
+	// DeploymentMode specifies how kata containers should be deployed.
+	// Valid values are: "MachineConfig" (use MCO), "DaemonSet" (use kata-deploy),
+	// or "Auto" (detect based on cluster type). If not specified, defaults to "Auto".
+	// +optional
+	// +kubebuilder:validation:Enum=MachineConfig;DaemonSet;Auto
+	DeploymentMode DeploymentMode `json:"deploymentMode,omitempty"`
+
+	// Platform specifies the target platform for kata installation.
+	// +optional
+	Platform string `json:"platform,omitempty"`
+
+	// HostComponentPaths allows specifying paths to host-installed components.
+	// Used when QEMU, virtiofsd, or kernel are installed via rpm-ostree.
+	// +optional
+	HostComponentPaths *HostComponentPaths `json:"hostComponentPaths,omitempty"`
+
+	// InitrdConfig specifies how the initrd should be provisioned.
+	// +optional
+	InitrdConfig *InitrdConfig `json:"initrdConfig,omitempty"`
+
+	// ExtensionsImage specifies the RHCOS extension image containing QEMU and virtiofsd RPMs.
+	// If not specified, the operator will attempt to auto-detect based on cluster version.
+	// For HCP/ROSA clusters, this should match the cluster's RHCOS version.
+	// Example: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:...
+	// +optional
+	ExtensionsImage string `json:"extensionsImage,omitempty"`
+}
+
+// DaemonSetDeploymentStatus contains the status of the DaemonSet deployment
+type DaemonSetDeploymentStatus struct {
+	// DesiredNumberScheduled is the total number of nodes that should be running the daemon pod
+	DesiredNumberScheduled int32 `json:"desiredNumberScheduled"`
+	// CurrentNumberScheduled is the number of nodes that are running at least 1 daemon pod
+	CurrentNumberScheduled int32 `json:"currentNumberScheduled"`
+	// NumberReady is the number of nodes with ready daemon pods
+	NumberReady int32 `json:"numberReady"`
+	// UpdatedNumberScheduled is the number of nodes with updated daemon pods
+	UpdatedNumberScheduled int32 `json:"updatedNumberScheduled"`
+	// ObservedGeneration is the most recent generation observed for this DaemonSet
+	ObservedGeneration int64 `json:"observedGeneration"`
 }
 
 // KataConfigStatus defines the observed state of KataConfig
@@ -62,6 +139,14 @@ type KataConfigStatus struct {
 	// +optional
 	// +kubebuilder:default:=false
 	WaitingForMcoToStart bool `json:"waitingForMcoToStart,omitempty"`
+
+	// ActiveDeploymentMode shows the currently active deployment mode
+	// +optional
+	ActiveDeploymentMode DeploymentMode `json:"activeDeploymentMode,omitempty"`
+
+	// DaemonSetStatus contains the status of the DaemonSet deployment (when using DaemonSet mode)
+	// +optional
+	DaemonSetStatus *DaemonSetDeploymentStatus `json:"daemonSetStatus,omitempty"`
 }
 
 // +genclient
