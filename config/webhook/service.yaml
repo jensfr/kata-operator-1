@@ -4,6 +4,9 @@ kind: Service
 metadata:
   name: webhook-service
   namespace: system
+  annotations:
+    # OpenShift service CA creates the webhook-server-cert secret
+    service.beta.openshift.io/serving-cert-secret-name: webhook-server-cert
 spec:
   ports:
     - port: 443

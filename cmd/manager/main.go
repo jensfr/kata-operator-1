@@ -142,6 +142,16 @@ func main() {
 			os.Exit(1)
 		}
 
+		// DaemonSet controller for HCP clusters (or explicit DaemonSet mode)
+		if err = (&controllers.DaemonSetReconciler{
+			Client: mgr.GetClient(),
+			Log:    ctrl.Log.WithName("controllers").WithName("DaemonSet"),
+			Scheme: mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create DaemonSet controller", "controller", "DaemonSet")
+			os.Exit(1)
+		}
+
 		if err = (&peerpodcontrollers.PeerPodReconciler{
 			Client: mgr.GetClient(),
 			Scheme: mgr.GetScheme(),

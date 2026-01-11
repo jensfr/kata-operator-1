@@ -122,6 +122,24 @@ func (r *KataConfigOpenShiftReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// Skip if explicitly using DaemonSet mode - let DaemonSetReconciler handle it
+	if r.kataConfig.Spec.DeploymentMode == kataconfigurationv1.DeploymentModeDaemonSet {
+		r.Log.V(1).Info("Skipping reconcile - DaemonSet mode is explicitly set, handled by DaemonSetReconciler")
+		return ctrl.Result{}, nil
+	}
+
+	// Also check ConfigMap for DaemonSet mode - let DaemonSetReconciler handle it
+	cfgMap := &corev1.ConfigMap{}
+	if err := r.Client.Get(context.TODO(), types.NamespacedName{
+		Name:      FgConfigMapName,
+		Namespace: OperatorNamespace,
+	}, cfgMap); err == nil {
+		if cfgMode, ok := cfgMap.Data[DeploymentModeConfig]; ok && cfgMode == "DaemonSet" {
+			r.Log.Info("Skipping reconcile - DaemonSet mode set via ConfigMap, handled by DaemonSetReconciler")
+			return ctrl.Result{}, nil
+		}
+	}
+
 	oldObjStatus := r.kataConfig.Status.DeepCopy()
 
 	err = r.migratePeerPodsLimit()
