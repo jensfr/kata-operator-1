@@ -95,17 +95,28 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true), SetTimeEncoderToRfc3339()))
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:  scheme,
-		Metrics: metricsserver.Options{BindAddress: metricsAddr},
-		WebhookServer: &webhook.DefaultServer{
+	// Allow disabling webhooks for environments without cert-manager (e.g., HCP clusters)
+	disableWebhooks := os.Getenv("DISABLE_WEBHOOKS") == "true"
+
+	mgrOptions := ctrl.Options{
+		Scheme:           scheme,
+		Metrics:          metricsserver.Options{BindAddress: metricsAddr},
+		LeaderElection:   enableLeaderElection,
+		LeaderElectionID: "290f4947.kataconfiguration.openshift.io",
+	}
+
+	// Only configure webhook server if webhooks are enabled
+	if !disableWebhooks {
+		mgrOptions.WebhookServer = &webhook.DefaultServer{
 			Options: webhook.Options{
 				Port: 9443,
 			},
-		},
-		LeaderElection:   enableLeaderElection,
-		LeaderElectionID: "290f4947.kataconfiguration.openshift.io",
-	})
+		}
+	} else {
+		setupLog.Info("Webhooks disabled via DISABLE_WEBHOOKS environment variable")
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -114,6 +125,13 @@ func main() {
 	isOpenshift, err := controllers.IsOpenShift()
 	if err != nil {
 		setupLog.Error(err, "unable to use discovery client")
+		os.Exit(1)
+	}
+
+	// Check if MachineConfig CRD is available (not available on HCP clusters)
+	hasMachineConfig, err := controllers.IsMachineConfigAvailable()
+	if err != nil {
+		setupLog.Error(err, "unable to check for MachineConfig CRD")
 		os.Exit(1)
 	}
 
@@ -133,13 +151,18 @@ func main() {
 
 		setupLog.Info("added labels")
 
-		if err = (&controllers.KataConfigOpenShiftReconciler{
-			Client: mgr.GetClient(),
-			Log:    ctrl.Log.WithName("controllers").WithName("KataConfig"),
-			Scheme: mgr.GetScheme(),
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create KataConfig controller for OpenShift cluster", "controller", "KataConfig")
-			os.Exit(1)
+		// Only register MCO-based controller if MachineConfig CRD is available
+		if hasMachineConfig {
+			if err = (&controllers.KataConfigOpenShiftReconciler{
+				Client: mgr.GetClient(),
+				Log:    ctrl.Log.WithName("controllers").WithName("KataConfig"),
+				Scheme: mgr.GetScheme(),
+			}).SetupWithManager(mgr); err != nil {
+				setupLog.Error(err, "unable to create KataConfig controller for OpenShift cluster", "controller", "KataConfig")
+				os.Exit(1)
+			}
+		} else {
+			setupLog.Info("MachineConfig CRD not available, skipping MCO-based controller (HCP mode)")
 		}
 
 		// DaemonSet controller for HCP clusters (or explicit DaemonSet mode)
@@ -152,22 +175,35 @@ func main() {
 			os.Exit(1)
 		}
 
-		if err = (&peerpodcontrollers.PeerPodReconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
-			// setting an empty array will delegate Provider creation to reconcile time, make sure RBAC permits:
-			//+kubebuilder:rbac:groups="",resourceNames=peer-pods-cm;peer-pods-secret,resources=configmaps;secrets,verbs=get
-			Providers: map[string]provider.Provider{},
-		}).SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create peerpod resources controller", "controller", "PeerPod")
-			os.Exit(1)
+		// Only register PeerPod controller if CRD is available
+		hasPeerPodCRD, err := controllers.IsPeerPodCRDAvailable()
+		if err != nil {
+			setupLog.Error(err, "unable to check for PeerPod CRD")
+			// Don't exit - PeerPod is optional
+		}
+		if hasPeerPodCRD {
+			if err = (&peerpodcontrollers.PeerPodReconciler{
+				Client: mgr.GetClient(),
+				Scheme: mgr.GetScheme(),
+				// setting an empty array will delegate Provider creation to reconcile time, make sure RBAC permits:
+				//+kubebuilder:rbac:groups="",resourceNames=peer-pods-cm;peer-pods-secret,resources=configmaps;secrets,verbs=get
+				Providers: map[string]provider.Provider{},
+			}).SetupWithManager(mgr); err != nil {
+				setupLog.Error(err, "unable to create peerpod resources controller", "controller", "PeerPod")
+				os.Exit(1)
+			}
+		} else {
+			setupLog.Info("PeerPod CRD not available, skipping PeerPod controller")
 		}
 
 	}
 
-	if err = (&kataconfigurationv1.KataConfig{}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "KataConfig")
-		os.Exit(1)
+	// Only set up webhooks if not disabled
+	if !disableWebhooks {
+		if err = (&kataconfigurationv1.KataConfig{}).SetupWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "KataConfig")
+			os.Exit(1)
+		}
 	}
 
 	if err = (&controllers.SecretReconciler{

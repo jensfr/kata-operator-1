@@ -15,12 +15,29 @@ limitations under the License.
 package controllers
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -42,7 +59,8 @@ import (
 const (
 	kataDeployDaemonSetName      = "kata-deploy"
 	kataDeployNamespace          = "openshift-sandboxed-containers-operator"
-	kataDeployServiceAccountName = "controller-manager"
+	kataDeployServiceAccountName = "default"
+	controllerManagerSAName      = "controller-manager" // SA with image-builder role for internal registry push
 	kataDeployFinalizer          = "kataconfiguration.openshift.io/daemonset-finalizer"
 
 	// Labels used for tracking kata runtime installation and cleanup
@@ -51,7 +69,61 @@ const (
 	// - "cleanup" during cleanup (node is being cleaned up)
 	// The controller uses the "cleanup" value to detect cleanup completion.
 	kataRuntimeLabel = "katacontainers.io/kata-runtime"
+
+	// Internal registry for storing the extracted kata RPMs image.
+	// This decouples kata-deploy from the RHCOS extensions image format.
+	internalRegistryService = "image-registry.openshift-image-registry.svc:5000"
+	kataRpmsImageName       = "kata-rpms"
+	kataRpmsImageTag        = "latest"
 )
+
+// kataRequiredRpmPrefixes lists all RPM package prefixes needed for kata containers.
+// This includes QEMU, virtiofsd, and all their dependencies.
+var kataRequiredRpmPrefixes = []string{
+	// Core QEMU packages
+	"qemu-kvm-core",
+	"qemu-kvm-common",
+	"qemu-img",
+	// virtiofsd
+	"virtiofsd",
+	// RDMA/InfiniBand libraries (QEMU dependencies)
+	"libibverbs", // Required by librdmacm
+	"rdma-core",  // May contain libibverbs on some systems
+	"librdmacm",
+	// Other QEMU dependencies
+	"pixman",
+	"libpng",
+	"libfdt",
+	"capstone",
+	// PMEM/NVDIMM libraries
+	"libpmem",
+	"ndctl-libs",
+	"daxctl-libs",
+	// BIOS/UEFI firmware
+	"seabios-bin",
+	"seavgabios-bin",
+	"edk2-ovmf",
+	"ipxe-roms-qemu",
+	// Kata containers package
+	"kata-containers",
+}
+
+// isRequiredRpm checks if an RPM filename matches any of the required package prefixes
+func isRequiredRpm(filename string) bool {
+	for _, prefix := range kataRequiredRpmPrefixes {
+		// Match prefix followed by version separator (- or _)
+		if strings.HasPrefix(filename, prefix+"-") || strings.HasPrefix(filename, prefix+"_") {
+			return true
+		}
+	}
+	return false
+}
+
+// rpmFile represents an extracted RPM file
+type rpmFile struct {
+	Name    string
+	Content []byte
+}
 
 // DaemonSetReconciler reconciles KataConfig using DaemonSet deployment mode.
 // This is used for HCP clusters (ROSA, ARO, IBM Cloud ROKS) where MCO is not available.
@@ -105,25 +177,36 @@ func (r *DaemonSetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return r.handleDeletion(ctx, kataConfig)
 	}
 
-	// 5. Ensure DaemonSet exists and is up to date
-	if err := r.reconcileDaemonSet(ctx, kataConfig); err != nil {
+	// 5. Reconcile kata-rpms image (extract RPMs from extensions, push to internal registry)
+	kataRpmsImage, err := r.reconcileKataRpmsImage(ctx, kataConfig)
+	if err != nil {
+		log.Error(err, "Failed to reconcile kata-rpms image")
+		// Don't fail completely - kata-deploy can still use baked RPMs
+		log.Info("Continuing with baked RPMs, kata-deploy may fail if versions don't match")
+	}
+
+	// 6. Ensure DaemonSet exists and is up to date
+	if err := r.reconcileDaemonSet(ctx, kataConfig, kataRpmsImage); err != nil {
 		log.Error(err, "Failed to reconcile DaemonSet")
 		return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
 	}
 
-	// 6. Ensure RuntimeClasses exist
+	// 7. Ensure RuntimeClasses exist
 	if err := r.reconcileRuntimeClasses(ctx, kataConfig); err != nil {
 		log.Error(err, "Failed to reconcile RuntimeClasses")
 		return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
 	}
 
-	// 7. Update status
+	// 8. Update status
 	if err := r.updateStatus(ctx, kataConfig); err != nil {
 		log.Error(err, "Failed to update status")
 		return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
 	}
 
-	return ctrl.Result{}, nil
+	// Periodically requeue to check for cluster version updates.
+	// The digest-based change detection in reconcileKataRpmsImage ensures
+	// we only re-extract RPMs when the extensions image actually changes.
+	return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 }
 
 // shouldReconcile determines if this controller should handle the KataConfig
@@ -170,8 +253,8 @@ func (r *DaemonSetReconciler) shouldReconcile(kataConfig *kataconfigurationv1.Ka
 }
 
 // reconcileDaemonSet creates/updates the kata-deploy DaemonSet
-func (r *DaemonSetReconciler) reconcileDaemonSet(ctx context.Context, kataConfig *kataconfigurationv1.KataConfig) error {
-	ds := r.buildDaemonSet(kataConfig)
+func (r *DaemonSetReconciler) reconcileDaemonSet(ctx context.Context, kataConfig *kataconfigurationv1.KataConfig, kataRpmsImage string) error {
+	ds := r.buildDaemonSet(kataConfig, kataRpmsImage)
 
 	// Set KataConfig as the owner
 	if err := controllerutil.SetControllerReference(kataConfig, ds, r.Scheme); err != nil {
@@ -197,7 +280,8 @@ func (r *DaemonSetReconciler) reconcileDaemonSet(ctx context.Context, kataConfig
 }
 
 // buildDaemonSet creates the kata-deploy DaemonSet spec
-func (r *DaemonSetReconciler) buildDaemonSet(kataConfig *kataconfigurationv1.KataConfig) *appsv1.DaemonSet {
+// kataRpmsImage is the internal registry image containing extracted RPMs (empty if using baked RPMs)
+func (r *DaemonSetReconciler) buildDaemonSet(kataConfig *kataconfigurationv1.KataConfig, kataRpmsImage string) *appsv1.DaemonSet {
 	labels := map[string]string{
 		"app":                          "kata-deploy",
 		"app.kubernetes.io/name":       "kata-deploy",
@@ -205,7 +289,7 @@ func (r *DaemonSetReconciler) buildDaemonSet(kataConfig *kataconfigurationv1.Kat
 	}
 
 	// Build environment variables from KataConfig
-	env := r.buildEnvVars(kataConfig)
+	env := r.buildEnvVars(kataConfig, kataRpmsImage)
 
 	// Privileged container is required for host access
 	privileged := true
@@ -236,6 +320,7 @@ func (r *DaemonSetReconciler) buildDaemonSet(kataConfig *kataconfigurationv1.Kat
 				Spec: corev1.PodSpec{
 					HostNetwork:        true,
 					HostPID:            true,
+					DNSPolicy:          corev1.DNSClusterFirstWithHostNet,
 					ServiceAccountName: kataDeployServiceAccountName,
 					PriorityClassName:  "system-node-critical",
 					NodeSelector: map[string]string{
@@ -292,7 +377,8 @@ func (r *DaemonSetReconciler) getKataDeployImage() string {
 }
 
 // buildEnvVars creates environment variables for the kata-deploy container
-func (r *DaemonSetReconciler) buildEnvVars(kataConfig *kataconfigurationv1.KataConfig) []corev1.EnvVar {
+// kataRpmsImage is the internal registry image containing the extracted RPMs
+func (r *DaemonSetReconciler) buildEnvVars(kataConfig *kataconfigurationv1.KataConfig, kataRpmsImage string) []corev1.EnvVar {
 	env := []corev1.EnvVar{
 		{
 			Name: "NODE_NAME",
@@ -347,10 +433,11 @@ func (r *DaemonSetReconciler) buildEnvVars(kataConfig *kataconfigurationv1.KataC
 		env = append(env, corev1.EnvVar{Name: "DEBUG", Value: "true"})
 	}
 
-	// Add extensions image if specified or auto-detected
-	extensionsImage := r.getExtensionsImage(kataConfig)
-	if extensionsImage != "" {
-		env = append(env, corev1.EnvVar{Name: "EXTENSIONS_IMAGE", Value: extensionsImage})
+	// Add kata-rpms image if available (internal registry image with extracted RPMs)
+	// This is our standardized format, independent of the RHCOS extensions image layout
+	if kataRpmsImage != "" {
+		env = append(env, corev1.EnvVar{Name: "KATA_RPMS_IMAGE", Value: kataRpmsImage})
+		r.Log.Info("Using kata-rpms image from internal registry", "image", kataRpmsImage)
 	}
 
 	return env
@@ -408,10 +495,17 @@ func (r *DaemonSetReconciler) buildVolumes() []corev1.Volume {
 
 // getExtensionsImage returns the RHCOS extension image URL.
 // Priority:
-// 1. If ExtensionsImage is set in KataConfig spec, use that
-// 2. Otherwise, try to auto-detect from ClusterVersion
-// 3. If auto-detection fails, return empty string (kata-deploy uses baked RPMs)
+// 1. RELATED_IMAGE_RHEL_COREOS_EXTENSIONS env var (for disconnected environments)
+// 2. ExtensionsImage set in KataConfig spec (explicit user override)
+// 3. Auto-detect from ClusterVersion release payload (for connected environments)
+// 4. If all fail, return empty string (kata-deploy uses baked RPMs)
 func (r *DaemonSetReconciler) getExtensionsImage(kataConfig *kataconfigurationv1.KataConfig) string {
+	// Check for disconnected environment override via env var
+	if image := os.Getenv("RELATED_IMAGE_RHEL_COREOS_EXTENSIONS"); image != "" {
+		r.Log.Info("Using RELATED_IMAGE_RHEL_COREOS_EXTENSIONS env var (disconnected mode)", "image", image)
+		return image
+	}
+
 	// Use explicit value from spec if provided
 	if kataConfig.Spec.ExtensionsImage != "" {
 		r.Log.Info("Using ExtensionsImage from KataConfig spec", "image", kataConfig.Spec.ExtensionsImage)
@@ -433,8 +527,11 @@ func (r *DaemonSetReconciler) getExtensionsImage(kataConfig *kataconfigurationv1
 }
 
 // detectExtensionsImage attempts to find the rhel-coreos-extensions image from the cluster's release.
-// This queries the ClusterVersion to get the release image, then looks up the extension image reference.
+// This queries the ClusterVersion to get the release image, then extracts the extension image reference
+// from the release payload using the cluster pull secret for authentication.
 func (r *DaemonSetReconciler) detectExtensionsImage() (string, error) {
+	ctx := context.Background()
+
 	// Get ClusterVersion to find the release image
 	cv := &unstructured.Unstructured{}
 	cv.SetGroupVersionKind(schema.GroupVersionKind{
@@ -443,7 +540,7 @@ func (r *DaemonSetReconciler) detectExtensionsImage() (string, error) {
 		Kind:    "ClusterVersion",
 	})
 
-	err := r.Client.Get(context.Background(), types.NamespacedName{Name: "version"}, cv)
+	err := r.Client.Get(ctx, types.NamespacedName{Name: "version"}, cv)
 	if err != nil {
 		return "", fmt.Errorf("failed to get ClusterVersion: %w", err)
 	}
@@ -456,18 +553,538 @@ func (r *DaemonSetReconciler) detectExtensionsImage() (string, error) {
 
 	r.Log.V(1).Info("Found release image from ClusterVersion", "releaseImage", releaseImage)
 
-	// To get the extension image, we need to query the release image manifest.
-	// This requires registry credentials and manifest parsing.
-	// For now, we'll check if there's an ImageContentSourcePolicy or ImageDigestMirrorSet
-	// that provides the mapping, or return empty to use the fallback.
-	//
-	// TODO: Implement full release image query using registry API
-	// For now, log the release image so users can manually set ExtensionsImage
-	r.Log.Info("Release image detected but auto-lookup of extension image not yet implemented",
-		"releaseImage", releaseImage,
-		"hint", "Set spec.extensionsImage in KataConfig, or run: oc adm release info "+releaseImage+" --image-for=rhel-coreos-extensions")
+	// Get the pull secret for registry authentication
+	keychain, err := r.getPullSecretKeychain(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get pull secret keychain: %w", err)
+	}
 
-	return "", nil
+	// Extract the rhel-coreos-extensions image from the release
+	extensionsImage, err := r.extractImageFromRelease(releaseImage, "rhel-coreos-extensions", keychain)
+	if err != nil {
+		r.Log.Info("Could not extract extensions image from release, manual configuration required",
+			"releaseImage", releaseImage,
+			"error", err.Error(),
+			"hint", "Set spec.extensionsImage in KataConfig, or run: oc adm release info "+releaseImage+" --image-for=rhel-coreos-extensions")
+		return "", nil
+	}
+
+	r.Log.Info("Successfully extracted extensions image from release", "extensionsImage", extensionsImage)
+	return extensionsImage, nil
+}
+
+// getPullSecretKeychain reads the cluster pull secret and returns an authn.Keychain for registry auth.
+func (r *DaemonSetReconciler) getPullSecretKeychain(ctx context.Context) (authn.Keychain, error) {
+	// Read the pull secret from openshift-config namespace
+	secret := &corev1.Secret{}
+	err := r.Client.Get(ctx, types.NamespacedName{
+		Name:      "pull-secret",
+		Namespace: "openshift-config",
+	}, secret)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pull-secret: %w", err)
+	}
+
+	// The pull secret is stored in .dockerconfigjson
+	dockerConfigJSON, ok := secret.Data[".dockerconfigjson"]
+	if !ok {
+		return nil, fmt.Errorf("pull-secret does not contain .dockerconfigjson")
+	}
+
+	// Parse the docker config
+	var dockerConfig struct {
+		Auths map[string]struct {
+			Auth string `json:"auth"`
+		} `json:"auths"`
+	}
+	if err := json.Unmarshal(dockerConfigJSON, &dockerConfig); err != nil {
+		return nil, fmt.Errorf("failed to parse docker config: %w", err)
+	}
+
+	// Create a keychain from the parsed config
+	return &pullSecretKeychain{auths: dockerConfig.Auths}, nil
+}
+
+// pullSecretKeychain implements authn.Keychain using the cluster pull secret
+type pullSecretKeychain struct {
+	auths map[string]struct {
+		Auth string `json:"auth"`
+	}
+}
+
+func (k *pullSecretKeychain) Resolve(resource authn.Resource) (authn.Authenticator, error) {
+	// Try to find credentials for this registry
+	registry := resource.RegistryStr()
+
+	if authEntry, ok := k.auths[registry]; ok {
+		return authn.FromConfig(authn.AuthConfig{Auth: authEntry.Auth}), nil
+	}
+
+	// Try with https:// prefix
+	if authEntry, ok := k.auths["https://"+registry]; ok {
+		return authn.FromConfig(authn.AuthConfig{Auth: authEntry.Auth}), nil
+	}
+
+	// For quay.io, try cloud.openshift.com credentials
+	// (OpenShift pull secrets use this key for quay.io/openshift-release-dev access)
+	if strings.HasPrefix(registry, "quay.io") {
+		if authEntry, ok := k.auths["cloud.openshift.com"]; ok {
+			return authn.FromConfig(authn.AuthConfig{Auth: authEntry.Auth}), nil
+		}
+	}
+
+	// Fall back to anonymous
+	return authn.Anonymous, nil
+}
+
+// extractImageFromRelease queries the release image and extracts a specific component image.
+// The release image contains an image-references file that maps component names to image refs.
+func (r *DaemonSetReconciler) extractImageFromRelease(releaseImageRef, componentName string, keychain authn.Keychain) (string, error) {
+	// Parse the release image reference
+	ref, err := name.ParseReference(releaseImageRef)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse release image reference: %w", err)
+	}
+
+	// Fetch the release image
+	img, err := remote.Image(ref, remote.WithAuthFromKeychain(keychain))
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch release image: %w", err)
+	}
+
+	// Get the image layers
+	layers, err := img.Layers()
+	if err != nil {
+		return "", fmt.Errorf("failed to get image layers: %w", err)
+	}
+
+	// Look for the image-references file in the layers
+	// It's typically in /release-manifests/image-references
+	for _, layer := range layers {
+		rc, err := layer.Uncompressed()
+		if err != nil {
+			continue
+		}
+		defer rc.Close()
+
+		// Read the layer as a tar archive
+		imageRef, err := r.findImageInTarLayer(rc, componentName)
+		if err == nil && imageRef != "" {
+			return imageRef, nil
+		}
+	}
+
+	return "", fmt.Errorf("component %s not found in release image", componentName)
+}
+
+// findImageInTarLayer searches a tar layer for the image-references file and extracts the component image.
+func (r *DaemonSetReconciler) findImageInTarLayer(rc io.Reader, componentName string) (string, error) {
+	tarReader := tar.NewReader(rc)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+
+		// Look for release-manifests/image-references
+		if header.Name == "release-manifests/image-references" || header.Name == "./release-manifests/image-references" {
+			// Read the file content
+			content, err := io.ReadAll(tarReader)
+			if err != nil {
+				return "", err
+			}
+
+			// Parse the image references (it's an ImageStream-like JSON)
+			return parseImageReferences(content, componentName)
+		}
+	}
+
+	return "", fmt.Errorf("image-references not found in layer")
+}
+
+// parseImageReferences parses the OpenShift release image-references file and returns
+// the image reference for the specified component.
+func parseImageReferences(content []byte, componentName string) (string, error) {
+	// The image-references file is an ImageStream-like structure
+	var imageRefs struct {
+		Kind string `json:"kind"`
+		Spec struct {
+			Tags []struct {
+				Name string `json:"name"`
+				From struct {
+					Name string `json:"name"`
+				} `json:"from"`
+			} `json:"tags"`
+		} `json:"spec"`
+	}
+
+	if err := json.Unmarshal(content, &imageRefs); err != nil {
+		return "", fmt.Errorf("failed to parse image-references: %w", err)
+	}
+
+	// Find the component in the tags
+	for _, tag := range imageRefs.Spec.Tags {
+		if tag.Name == componentName {
+			return tag.From.Name, nil
+		}
+	}
+
+	return "", fmt.Errorf("component %s not found in image-references", componentName)
+}
+
+// reconcileKataRpmsImage ensures the kata-rpms image exists in the internal registry.
+// It extracts RPMs from the extensions image and pushes them in our standard layout.
+// Returns the internal image reference for kata-deploy to use.
+func (r *DaemonSetReconciler) reconcileKataRpmsImage(ctx context.Context, kataConfig *kataconfigurationv1.KataConfig) (string, error) {
+	// Get the extensions image reference
+	extensionsImageRef := r.getExtensionsImage(kataConfig)
+	if extensionsImageRef == "" {
+		r.Log.Info("No extensions image available, kata-deploy will use baked RPMs")
+		return "", nil
+	}
+
+	// Calculate digest of extensions image for change detection
+	extensionsDigest, err := r.getImageDigest(extensionsImageRef)
+	if err != nil {
+		r.Log.Error(err, "Failed to get extensions image digest", "image", extensionsImageRef)
+		return "", err
+	}
+
+	// Check if we already processed this version
+	internalImageRef := fmt.Sprintf("%s/%s/%s:%s",
+		internalRegistryService, kataDeployNamespace, kataRpmsImageName, kataRpmsImageTag)
+
+	if kataConfig.Status.ExtensionsImageDigest == extensionsDigest {
+		r.Log.V(1).Info("Extensions image unchanged, using cached kata-rpms image",
+			"digest", extensionsDigest, "internalImage", internalImageRef)
+		return internalImageRef, nil
+	}
+
+	r.Log.Info("Building kata-rpms image from extensions",
+		"extensionsImage", extensionsImageRef,
+		"extensionsDigest", extensionsDigest)
+
+	// Get pull secret keychain for accessing the extensions image
+	keychain, err := r.getPullSecretKeychain(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get pull secret: %w", err)
+	}
+
+	// Extract RPMs from extensions image
+	rpms, err := r.extractRpmsFromExtensions(extensionsImageRef, keychain)
+	if err != nil {
+		return "", fmt.Errorf("failed to extract RPMs from extensions image: %w", err)
+	}
+
+	if len(rpms) == 0 {
+		r.Log.Info("No RPMs found in extensions image, kata-deploy will use baked RPMs")
+		return "", nil
+	}
+
+	r.Log.Info("Extracted RPMs from extensions image", "count", len(rpms), "rpms", rpmNames(rpms))
+
+	// Build the kata-rpms image with our standard layout
+	kataRpmsImage, err := r.buildKataRpmsImage(rpms)
+	if err != nil {
+		return "", fmt.Errorf("failed to build kata-rpms image: %w", err)
+	}
+
+	// Get internal registry credentials
+	internalKeychain, err := r.getInternalRegistryKeychain(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get internal registry credentials: %w", err)
+	}
+
+	// Push to internal registry
+	ref, err := name.ParseReference(internalImageRef, name.Insecure)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse internal image reference: %w", err)
+	}
+
+	// Use insecure transport for internal registry (uses cluster-internal CA)
+	transport := remote.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
+	if err := remote.Write(ref, kataRpmsImage,
+		remote.WithAuthFromKeychain(internalKeychain),
+		remote.WithTransport(transport)); err != nil {
+		return "", fmt.Errorf("failed to push kata-rpms image to internal registry: %w", err)
+	}
+
+	r.Log.Info("Pushed kata-rpms image to internal registry", "image", internalImageRef)
+
+	// Update status with the digest we processed and the resulting image
+	kataConfig.Status.ExtensionsImageDigest = extensionsDigest
+	kataConfig.Status.KataRpmsImage = internalImageRef
+
+	return internalImageRef, nil
+}
+
+// getImageDigest returns the digest of an image reference
+func (r *DaemonSetReconciler) getImageDigest(imageRef string) (string, error) {
+	ref, err := name.ParseReference(imageRef)
+	if err != nil {
+		return "", err
+	}
+
+	// If the reference already contains a digest, use it
+	if digest, ok := ref.(name.Digest); ok {
+		return digest.DigestStr(), nil
+	}
+
+	// Otherwise, we need to resolve the tag to a digest
+	// For now, use the reference string as the cache key
+	// A full implementation would fetch the manifest to get the actual digest
+	h := sha256.Sum256([]byte(imageRef))
+	return hex.EncodeToString(h[:]), nil
+}
+
+// extractRpmsFromExtensions extracts the kata-related RPMs from the extensions image
+func (r *DaemonSetReconciler) extractRpmsFromExtensions(extensionsImageRef string, keychain authn.Keychain) ([]rpmFile, error) {
+	ref, err := name.ParseReference(extensionsImageRef)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse extensions image reference: %w", err)
+	}
+
+	img, err := remote.Image(ref, remote.WithAuthFromKeychain(keychain))
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch extensions image: %w", err)
+	}
+
+	layers, err := img.Layers()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get image layers: %w", err)
+	}
+
+	var rpms []rpmFile
+
+	// Search through layers for RPM files
+	for _, layer := range layers {
+		rc, err := layer.Uncompressed()
+		if err != nil {
+			continue
+		}
+
+		layerRpms, err := r.extractRpmsFromTar(rc)
+		rc.Close()
+
+		if err != nil {
+			r.Log.V(1).Info("Error extracting RPMs from layer", "error", err.Error())
+			continue
+		}
+
+		rpms = append(rpms, layerRpms...)
+	}
+
+	return rpms, nil
+}
+
+// extractRpmsFromTar extracts RPM files matching our patterns from a tar stream
+func (r *DaemonSetReconciler) extractRpmsFromTar(reader io.Reader) ([]rpmFile, error) {
+	tarReader := tar.NewReader(reader)
+	var rpms []rpmFile
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return rpms, err
+		}
+
+		// Skip directories
+		if header.Typeflag == tar.TypeDir {
+			continue
+		}
+
+		// Check if this is an RPM file we want
+		filename := filepath.Base(header.Name)
+		if !strings.HasSuffix(filename, ".rpm") {
+			continue
+		}
+
+		// Check if it matches any of our required package prefixes
+		if !isRequiredRpm(filename) {
+			continue
+		}
+
+		// Read the RPM content
+		content, err := io.ReadAll(tarReader)
+		if err != nil {
+			r.Log.Error(err, "Failed to read RPM file", "file", filename)
+			continue
+		}
+
+		rpms = append(rpms, rpmFile{
+			Name:    filename,
+			Content: content,
+		})
+
+		r.Log.V(1).Info("Extracted RPM", "file", filename, "size", len(content))
+	}
+
+	return rpms, nil
+}
+
+// buildKataRpmsImage creates a minimal OCI image containing the RPMs in our standard layout
+func (r *DaemonSetReconciler) buildKataRpmsImage(rpms []rpmFile) (v1.Image, error) {
+	// Create a tar archive with the RPMs in /rpms/ directory
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	// Add /rpms directory
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "rpms/",
+		Mode:     0755,
+		Typeflag: tar.TypeDir,
+	}); err != nil {
+		return nil, err
+	}
+
+	// Add each RPM file
+	for _, rpm := range rpms {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: "rpms/" + rpm.Name,
+			Mode: 0644,
+			Size: int64(len(rpm.Content)),
+		}); err != nil {
+			return nil, err
+		}
+		if _, err := tw.Write(rpm.Content); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+
+	// Create a layer from the tar archive
+	layer, err := tarball.LayerFromReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create image layer: %w", err)
+	}
+
+	// Start with an empty image and add our layer
+	img, err := mutate.AppendLayers(empty.Image, layer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to append layer to image: %w", err)
+	}
+
+	return img, nil
+}
+
+// getInternalRegistryKeychain returns a keychain for authenticating to the internal OpenShift registry
+func (r *DaemonSetReconciler) getInternalRegistryKeychain(ctx context.Context) (authn.Keychain, error) {
+	// Get the service account token for authentication to internal registry
+	// The controller-manager SA has the image-builder role for pushing to internal registry
+
+	// List all secrets in namespace and find ones for controller-manager SA
+	// OpenShift uses annotation "openshift.io/internal-registry-auth-token.service-account" instead of labels
+	allSecrets := &corev1.SecretList{}
+	if err := r.Client.List(ctx, allSecrets, client.InNamespace(kataDeployNamespace)); err != nil {
+		return nil, fmt.Errorf("failed to list secrets: %w", err)
+	}
+
+	// Look for dockercfg secrets belonging to controller-manager service account
+	for _, secret := range allSecrets.Items {
+		if secret.Type != corev1.SecretTypeDockercfg && secret.Type != corev1.SecretTypeDockerConfigJson {
+			continue
+		}
+		// Check annotation for SA ownership (OpenShift 4.x style)
+		if sa, ok := secret.Annotations["openshift.io/internal-registry-auth-token.service-account"]; ok {
+			if sa == controllerManagerSAName {
+				r.Log.V(1).Info("Found internal registry auth secret", "secret", secret.Name)
+				return &internalRegistryKeychain{secret: secret.DeepCopy()}, nil
+			}
+		}
+		// Also check by name pattern as fallback (controller-manager-dockercfg-*)
+		if strings.HasPrefix(secret.Name, controllerManagerSAName+"-dockercfg-") {
+			r.Log.V(1).Info("Found dockercfg secret by name pattern", "secret", secret.Name)
+			return &internalRegistryKeychain{secret: secret.DeepCopy()}, nil
+		}
+	}
+
+	// Fall back to using the service account token directly
+	// Get SA token from the mounted secret or create a token
+	tokenSecret := &corev1.Secret{}
+	if err := r.Client.Get(ctx, types.NamespacedName{
+		Name:      controllerManagerSAName + "-token",
+		Namespace: kataDeployNamespace,
+	}, tokenSecret); err == nil {
+		if token, ok := tokenSecret.Data["token"]; ok {
+			return &bearerTokenKeychain{token: string(token)}, nil
+		}
+	}
+
+	// If no token found, try anonymous (may work for internal registry in some configs)
+	r.Log.Info("No SA token found, attempting anonymous access to internal registry")
+	return authn.DefaultKeychain, nil
+}
+
+// internalRegistryKeychain implements authn.Keychain using a docker config secret
+type internalRegistryKeychain struct {
+	secret *corev1.Secret
+}
+
+func (k *internalRegistryKeychain) Resolve(resource authn.Resource) (authn.Authenticator, error) {
+	registry := resource.RegistryStr()
+
+	if k.secret.Type == corev1.SecretTypeDockerConfigJson {
+		// .dockerconfigjson format: {"auths": {"registry": {"auth": "..."}}}
+		configJSON := k.secret.Data[".dockerconfigjson"]
+		var config struct {
+			Auths map[string]struct {
+				Auth string `json:"auth"`
+			} `json:"auths"`
+		}
+		if err := json.Unmarshal(configJSON, &config); err != nil {
+			return nil, err
+		}
+		if auth, ok := config.Auths[registry]; ok {
+			return authn.FromConfig(authn.AuthConfig{Auth: auth.Auth}), nil
+		}
+	} else if k.secret.Type == corev1.SecretTypeDockercfg {
+		// .dockercfg format: {"registry": {"auth": "..."}} (no auths wrapper)
+		configData := k.secret.Data[".dockercfg"]
+		var config map[string]struct {
+			Auth string `json:"auth"`
+		}
+		if err := json.Unmarshal(configData, &config); err != nil {
+			return nil, err
+		}
+		if auth, ok := config[registry]; ok {
+			return authn.FromConfig(authn.AuthConfig{Auth: auth.Auth}), nil
+		}
+	}
+
+	return authn.Anonymous, nil
+}
+
+// bearerTokenKeychain implements authn.Keychain using a bearer token
+type bearerTokenKeychain struct {
+	token string
+}
+
+func (k *bearerTokenKeychain) Resolve(resource authn.Resource) (authn.Authenticator, error) {
+	return &authn.Basic{
+		Username: "serviceaccount",
+		Password: k.token,
+	}, nil
+}
+
+// rpmNames returns a list of RPM filenames for logging
+func rpmNames(rpms []rpmFile) []string {
+	names := make([]string, len(rpms))
+	for i, rpm := range rpms {
+		names[i] = rpm.Name
+	}
+	return names
 }
 
 // reconcileRuntimeClasses creates RuntimeClasses for each configured shim
@@ -731,6 +1348,8 @@ func (r *DaemonSetReconciler) cleanupLabelsAndFinalize(ctx context.Context, kata
 // finalizeDeletion removes the finalizer to allow KataConfig deletion
 func (r *DaemonSetReconciler) finalizeDeletion(ctx context.Context, kataConfig *kataconfigurationv1.KataConfig) (ctrl.Result, error) {
 	// RuntimeClasses are deleted automatically via owner references
+	// RBAC resources (kata-deploy ClusterRole/ClusterRoleBinding) are static manifests
+	// deployed with the operator and persist across KataConfig lifecycle
 
 	// Remove finalizer
 	controllerutil.RemoveFinalizer(kataConfig, kataDeployFinalizer)

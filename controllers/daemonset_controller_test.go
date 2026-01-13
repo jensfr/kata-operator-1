@@ -218,6 +218,7 @@ var _ = Describe("DaemonSetController", func() {
 			// Verify DaemonSet spec
 			Expect(daemonSet.Spec.Template.Spec.HostNetwork).To(BeTrue())
 			Expect(daemonSet.Spec.Template.Spec.HostPID).To(BeTrue())
+			Expect(daemonSet.Spec.Template.Spec.DNSPolicy).To(Equal(corev1.DNSClusterFirstWithHostNet))
 			Expect(daemonSet.Spec.Template.Spec.PriorityClassName).To(Equal("system-node-critical"))
 
 			// Verify container configuration

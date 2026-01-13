@@ -147,6 +147,16 @@ type KataConfigStatus struct {
 	// DaemonSetStatus contains the status of the DaemonSet deployment (when using DaemonSet mode)
 	// +optional
 	DaemonSetStatus *DaemonSetDeploymentStatus `json:"daemonSetStatus,omitempty"`
+
+	// ExtensionsImageDigest is the digest of the extensions image that was last processed.
+	// Used to detect when the cluster version changes and RPMs need to be re-extracted.
+	// +optional
+	ExtensionsImageDigest string `json:"extensionsImageDigest,omitempty"`
+
+	// KataRpmsImage is the internal registry image containing the extracted kata RPMs.
+	// This is populated after successful extraction from the extensions image.
+	// +optional
+	KataRpmsImage string `json:"kataRpmsImage,omitempty"`
 }
 
 // +genclient

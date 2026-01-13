@@ -52,3 +52,86 @@ roleRef:
   kind: ClusterRole
   name: manager-role
   apiGroup: rbac.authorization.k8s.io
+---
+# ============================================================
+# RBAC for kata-deploy pods (DaemonSet mode)
+# kata-deploy pods run under the 'default' SA and need:
+# - CRD access for NFD NodeFeatureRules
+# - NFD NodeFeatureRules for hardware feature detection
+# - Node access for labeling and version detection
+# ============================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kata-deploy
+  labels:
+    app.kubernetes.io/name: kata-deploy
+    app.kubernetes.io/managed-by: sandboxed-containers-operator
+rules:
+# NFD CRD access for TDX/SNP hardware detection
+- apiGroups:
+  - apiextensions.k8s.io
+  resources:
+  - customresourcedefinitions
+  verbs:
+  - get
+  - list
+  - create
+  - update
+  - patch
+# NFD NodeFeatureRules for hardware feature detection
+- apiGroups:
+  - nfd.k8s-sigs.io
+  resources:
+  - nodefeaturerules
+  verbs:
+  - get
+  - list
+  - create
+  - update
+  - patch
+  - delete
+# Node access for labeling and version detection
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kata-deploy
+  labels:
+    app.kubernetes.io/name: kata-deploy
+    app.kubernetes.io/managed-by: sandboxed-containers-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kata-deploy
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: openshift-sandboxed-containers-operator
+---
+# Grant default SA access to privileged SCC for kata-deploy DaemonSet
+# kata-deploy requires hostNetwork, hostPID, hostPath volumes
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kata-deploy-privileged-scc
+  labels:
+    app.kubernetes.io/name: kata-deploy
+    app.kubernetes.io/managed-by: sandboxed-containers-operator
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: openshift-sandboxed-containers-operator
+roleRef:
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+  apiGroup: rbac.authorization.k8s.io

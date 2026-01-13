@@ -80,6 +80,13 @@ spec:
                   EnablePeerPods is used to transparently create pods on a remote system.
                   For more information on how this works, please refer to the sandboxed containers documentation - https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.6/html/user_guide/deploying-public-cloud#deploying-public-cloud
                 type: boolean
+              extensionsImage:
+                description: |-
+                  ExtensionsImage specifies the RHCOS extension image containing QEMU and virtiofsd RPMs.
+                  If not specified, the operator will attempt to auto-detect based on cluster version.
+                  For HCP/ROSA clusters, this should match the cluster's RHCOS version.
+                  Example: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:...
+                type: string
               hostComponentPaths:
                 description: |-
                   HostComponentPaths allows specifying paths to host-installed components.
@@ -231,6 +238,11 @@ spec:
                 - observedGeneration
                 - updatedNumberScheduled
                 type: object
+              extensionsImageDigest:
+                description: |-
+                  ExtensionsImageDigest is the digest of the extensions image that was last processed.
+                  Used to detect when the cluster version changes and RPMs need to be re-extracted.
+                type: string
               kataNodes:
                 properties:
                   failedToInstall:
@@ -274,6 +286,11 @@ spec:
                       type: string
                     type: array
                 type: object
+              kataRpmsImage:
+                description: |-
+                  KataRpmsImage is the internal registry image containing the extracted kata RPMs.
+                  This is populated after successful extraction from the extensions image.
+                type: string
               runtimeClasses:
                 description: RuntimeClasses is the names of the RuntimeClasses created
                   by this controller

@@ -101,10 +101,10 @@ spec:
           resources:
             limits:
               cpu: 200m
-              memory: 256Mi
+              memory: 2Gi  # Increased for RPM extraction from extensions image
             requests:
               cpu: 100m
-              memory: 40Mi
+              memory: 128Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

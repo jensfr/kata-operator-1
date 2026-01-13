@@ -64,12 +64,55 @@ spec:
                   This is currently done through the use of the Node Feature Discovery Operator (NFD).
                   For more information on how the check works, please refer to the sandboxed containers documentation - https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.6/html-single/user_guide/index#about-node-eligibility-checks_about-osc
                 type: boolean
+              deploymentMode:
+                description: |-
+                  DeploymentMode specifies how kata containers should be deployed.
+                  Valid values are: "MachineConfig" (use MCO), "DaemonSet" (use kata-deploy),
+                  or "Auto" (detect based on cluster type). If not specified, defaults to "Auto".
+                enum:
+                - MachineConfig
+                - DaemonSet
+                - Auto
+                type: string
               enablePeerPods:
                 default: false
                 description: |-
                   EnablePeerPods is used to transparently create pods on a remote system.
                   For more information on how this works, please refer to the sandboxed containers documentation - https://docs.redhat.com/en/documentation/openshift_sandboxed_containers/1.6/html/user_guide/deploying-public-cloud#deploying-public-cloud
                 type: boolean
+              extensionsImage:
+                description: |-
+                  ExtensionsImage specifies the RHCOS extension image containing QEMU and virtiofsd RPMs.
+                  If not specified, the operator will attempt to auto-detect based on cluster version.
+                  For HCP/ROSA clusters, this should match the cluster's RHCOS version.
+                  Example: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:...
+                type: string
+              hostComponentPaths:
+                description: |-
+                  HostComponentPaths allows specifying paths to host-installed components.
+                  Used when QEMU, virtiofsd, or kernel are installed via rpm-ostree.
+                properties:
+                  kernelPath:
+                    description: KernelPath is the path to the kernel on the host
+                    type: string
+                  qemuPath:
+                    description: QemuPath is the path to the QEMU binary on the host
+                    type: string
+                  virtiofsdPath:
+                    description: VirtiofsdPath is the path to virtiofsd on the host
+                    type: string
+                type: object
+              initrdConfig:
+                description: InitrdConfig specifies how the initrd should be provisioned.
+                properties:
+                  buildAtRuntime:
+                    description: BuildAtRuntime specifies whether to build initrd
+                      at runtime
+                    type: boolean
+                  prebuiltPath:
+                    description: PrebuiltPath is the path to a prebuilt initrd
+                    type: string
+                type: object
               kataConfigPoolSelector:
                 description: |-
                   KataConfigPoolSelector is used to filter the worker nodes
@@ -124,12 +167,19 @@ spec:
                 description: Sets log level on kata-equipped nodes.  Valid values
                   are the same as for `crio --log-level`.
                 type: string
+              platform:
+                description: Platform specifies the target platform for kata installation.
+                type: string
             required:
             - checkNodeEligibility
             type: object
           status:
             description: KataConfigStatus defines the observed state of KataConfig
             properties:
+              activeDeploymentMode:
+                description: ActiveDeploymentMode shows the currently active deployment
+                  mode
+                type: string
               conditions:
                 items:
                   properties:
@@ -152,6 +202,47 @@ spec:
                   - type
                   type: object
                 type: array
+              daemonSetStatus:
+                description: DaemonSetStatus contains the status of the DaemonSet
+                  deployment (when using DaemonSet mode)
+                properties:
+                  currentNumberScheduled:
+                    description: CurrentNumberScheduled is the number of nodes that
+                      are running at least 1 daemon pod
+                    format: int32
+                    type: integer
+                  desiredNumberScheduled:
+                    description: DesiredNumberScheduled is the total number of nodes
+                      that should be running the daemon pod
+                    format: int32
+                    type: integer
+                  numberReady:
+                    description: NumberReady is the number of nodes with ready daemon
+                      pods
+                    format: int32
+                    type: integer
+                  observedGeneration:
+                    description: ObservedGeneration is the most recent generation
+                      observed for this DaemonSet
+                    format: int64
+                    type: integer
+                  updatedNumberScheduled:
+                    description: UpdatedNumberScheduled is the number of nodes with
+                      updated daemon pods
+                    format: int32
+                    type: integer
+                required:
+                - currentNumberScheduled
+                - desiredNumberScheduled
+                - numberReady
+                - observedGeneration
+                - updatedNumberScheduled
+                type: object
+              extensionsImageDigest:
+                description: |-
+                  ExtensionsImageDigest is the digest of the extensions image that was last processed.
+                  Used to detect when the cluster version changes and RPMs need to be re-extracted.
+                type: string
               kataNodes:
                 properties:
                   failedToInstall:
@@ -195,6 +286,11 @@ spec:
                       type: string
                     type: array
                 type: object
+              kataRpmsImage:
+                description: |-
+                  KataRpmsImage is the internal registry image containing the extracted kata RPMs.
+                  This is populated after successful extraction from the extensions image.
+                type: string
               runtimeClasses:
                 description: RuntimeClasses is the names of the RuntimeClasses created
                   by this controller

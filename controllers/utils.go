@@ -69,6 +69,70 @@ func IsOpenShift() (bool, error) {
 	return false, nil
 }
 
+// IsMachineConfigAvailable checks if the MachineConfig CRD is available in the cluster.
+// This is used to determine if we can use the MachineConfig-based deployment mode.
+// On HCP clusters (ROSA, ARO, IBM Cloud ROKS), MachineConfig CRD is not available.
+func IsMachineConfigAvailable() (bool, error) {
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return false, err
+	}
+
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return false, err
+	}
+
+	// Check if machineconfiguration.openshift.io API group exists
+	apiGroup, _, err := discoveryClient.ServerGroupsAndResources()
+	if err != nil {
+		// Partial errors are common when some resources can't be listed
+		// We should still check what we got
+		if !discovery.IsGroupDiscoveryFailedError(err) {
+			return false, err
+		}
+	}
+
+	for i := 0; i < len(apiGroup); i++ {
+		if apiGroup[i].Name == "machineconfiguration.openshift.io" {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// IsPeerPodCRDAvailable checks if the PeerPod CRD is available in the cluster.
+// This is used to determine if we should register the PeerPod controller.
+func IsPeerPodCRDAvailable() (bool, error) {
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return false, err
+	}
+
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return false, err
+	}
+
+	// Check if confidentialcontainers.org API group exists
+	apiGroup, _, err := discoveryClient.ServerGroupsAndResources()
+	if err != nil {
+		// Partial errors are common when some resources can't be listed
+		if !discovery.IsGroupDiscoveryFailedError(err) {
+			return false, err
+		}
+	}
+
+	for i := 0; i < len(apiGroup); i++ {
+		if apiGroup[i].Name == "confidentialcontainers.org" {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 func parseJobYAML(yamlData []byte) (*batchv1.Job, error) {
 	job := &batchv1.Job{}
 	err := yaml.Unmarshal(yamlData, job)
