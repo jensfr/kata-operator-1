@@ -10,22 +10,25 @@ import (
 )
 
 const (
-	FgConfigMapName         = "osc-feature-gates"
-	ConfidentialFeatureGate = "confidential"
-	LayeredImageDeployment  = "layeredImageDeployment"
-	DeploymentModeConfig    = "deploymentMode"
+	FgConfigMapName          = "osc-feature-gates"
+	ConfidentialFeatureGate  = "confidential"
+	LayeredImageDeployment   = "layeredImageDeployment"
+	DeploymentModeConfig     = "deploymentMode"
+	AgentSandboxFeatureGate  = "agentSandbox"
 )
 
 var DefaultFeatureGates = FeatureGateStatus{
 	Confidential:           false,
 	LayeredImageDeployment: false,
 	DeploymentModeOption:   MachineConfigOption,
+	AgentSandbox:           false,
 }
 
 type FeatureGateStatus struct {
 	Confidential           bool
 	LayeredImageDeployment bool
 	DeploymentModeOption   DeploymentModeOption
+	AgentSandbox           bool
 }
 
 // Create enum to represent the state of the feature gates
@@ -48,6 +51,7 @@ func (r *KataConfigOpenShiftReconciler) NewFeatureGateStatus() (*FeatureGateStat
 		Confidential:           DefaultFeatureGates.Confidential,
 		LayeredImageDeployment: DefaultFeatureGates.LayeredImageDeployment,
 		DeploymentModeOption:   DefaultFeatureGates.DeploymentModeOption,
+		AgentSandbox:           DefaultFeatureGates.AgentSandbox,
 	}
 
 	cfgMap := &corev1.ConfigMap{}
@@ -78,6 +82,14 @@ func (r *KataConfigOpenShiftReconciler) NewFeatureGateStatus() (*FeatureGateStat
 				fgStatus.DeploymentModeOption = mode
 			}
 		}
+		if value, ok := cfgMap.Data[AgentSandboxFeatureGate]; ok {
+			agentSandbox, err := strconv.ParseBool(value)
+			if err != nil {
+				r.Log.Info("Couldn't parse agentSandbox status, using default value", "default", DefaultFeatureGates.AgentSandbox, "error", err)
+			} else {
+				fgStatus.AgentSandbox = agentSandbox
+			}
+		}
 	}
 
 	if k8serrors.IsNotFound(err) {
@@ -88,8 +100,9 @@ func (r *KataConfigOpenShiftReconciler) NewFeatureGateStatus() (*FeatureGateStat
 }
 
 var statusChecker = map[string]func(fgstatus *FeatureGateStatus) bool{
-	ConfidentialFeatureGate: func(fgstatus *FeatureGateStatus) bool { return fgstatus.Confidential },
-	LayeredImageDeployment:  func(fgstatus *FeatureGateStatus) bool { return fgstatus.LayeredImageDeployment },
+	ConfidentialFeatureGate:  func(fgstatus *FeatureGateStatus) bool { return fgstatus.Confidential },
+	LayeredImageDeployment:   func(fgstatus *FeatureGateStatus) bool { return fgstatus.LayeredImageDeployment },
+	AgentSandboxFeatureGate:  func(fgstatus *FeatureGateStatus) bool { return fgstatus.AgentSandbox },
 }
 
 func (fgstatus *FeatureGateStatus) IsEnabled(key string) bool {
@@ -126,6 +139,19 @@ func (r *KataConfigOpenShiftReconciler) processFeatureGates() error {
 
 	if err := r.handleDeploymentModeFeature(fgStatus.DeploymentModeOption); err != nil {
 		return err
+	}
+
+	// Handle agent sandbox feature gate
+	if fgStatus.IsEnabled(AgentSandboxFeatureGate) {
+		r.Log.Info("Feature gate is enabled", "featuregate", AgentSandboxFeatureGate)
+		if err := r.handleAgentSandboxFeature(Enabled); err != nil {
+			return err
+		}
+	} else {
+		r.Log.Info("Feature gate is disabled", "featuregate", AgentSandboxFeatureGate)
+		if err := r.handleAgentSandboxFeature(Disabled); err != nil {
+			return err
+		}
 	}
 
 	if r.DeploymentMode == DaemonSetMode {

@@ -1,0 +1,44 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: subscriptions.operators.coreos.com
+spec:
+  group: operators.coreos.com
+  names:
+    kind: Subscription
+    listKind: SubscriptionList
+    plural: subscriptions
+    singular: subscription
+    shortNames:
+      - sub
+      - subs
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                channel:
+                  type: string
+                installPlanApproval:
+                  type: string
+                name:
+                  type: string
+                source:
+                  type: string
+                sourceNamespace:
+                  type: string
+                startingCSV:
+                  type: string
+                config:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
