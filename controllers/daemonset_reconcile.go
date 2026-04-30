@@ -25,6 +25,11 @@ import (
 const (
 	kataInstallDaemonSetName       = "osc-rpm"
 	kataInstallationDaemonSetLabel = "kataconfiguration.openshift.io/kata-ds-rpm-install"
+
+	liteInstallDaemonSetName = "osc-lite"
+	liteDaemonSetLabel       = "kataconfiguration.openshift.io/osc-lite-install"
+	liteDefaultImage         = "quay.io/jensfr/krun:latest"
+	liteDaemonSetImage       = "quay.io/jensfr/osc-operator:daemonset-krun-dev"
 )
 
 const (
@@ -150,6 +155,18 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequestDaemonSet(
 	err = r.deleteDaemonsetForMonitor()
 	if err != nil {
 		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 15}, err
+	}
+
+	// Clean up osc-lite if it was enabled
+	fgStatus, fgErr := r.NewFeatureGateStatus()
+	if fgErr == nil && fgStatus.EnableLite {
+		r.Log.Info("Removing lite deployment (DaemonSet mode)")
+		if err := r.removeLiteConfigDaemonSet(); err != nil {
+			r.Log.Error(err, "failed to remove lite config daemonset")
+		}
+		if err := r.deleteRuntimeClass(liteRuntimeClassName); err != nil {
+			r.Log.Error(err, "failed to delete lite runtime class")
+		}
 	}
 
 	if r.kataConfig.Spec.EnablePeerPods {
@@ -768,4 +785,153 @@ func (r *KataConfigOpenShiftReconciler) unlabelNodesDaemonSet(nodeSelector label
 		}
 	}
 	return nil
+}
+
+// addLiteConfigDaemonSet creates or updates the osc-lite configuration DaemonSet.
+func (r *KataConfigOpenShiftReconciler) addLiteConfigDaemonSet() error {
+	liteDaemonSet, err := r.daemonSetForLiteConfig(InstallKata)
+	if err != nil {
+		return err
+	}
+
+	foundDs := &appsv1.DaemonSet{}
+	err = r.Client.Get(context.TODO(), types.NamespacedName{
+		Name:      liteDaemonSet.Name,
+		Namespace: liteDaemonSet.Namespace,
+	}, foundDs)
+
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			r.Log.Info("Creating osc-lite configuration daemonset", "Name", liteDaemonSet.Name)
+			if err = controllerutil.SetControllerReference(r.kataConfig, liteDaemonSet, r.Scheme); err != nil {
+				return err
+			}
+			return r.Client.Create(context.TODO(), liteDaemonSet)
+		}
+		r.Log.Error(err, "could not get osc-lite configuration daemonset")
+		return err
+	}
+
+	r.Log.Info("Updating osc-lite configuration daemonset", "Name", liteDaemonSet.Name)
+	return r.Client.Update(context.TODO(), liteDaemonSet)
+}
+
+// removeLiteConfigDaemonSet removes the osc-lite install DaemonSet and creates an uninstall DaemonSet.
+func (r *KataConfigOpenShiftReconciler) removeLiteConfigDaemonSet() error {
+	installDs := &appsv1.DaemonSet{}
+	installName := liteInstallDaemonSetName + "-" + string(InstallKata)
+	err := r.Client.Get(context.TODO(), types.NamespacedName{
+		Name:      installName,
+		Namespace: OperatorNamespace,
+	}, installDs)
+	if err == nil {
+		r.Log.Info("Deleting osc-lite install daemonset", "Name", installName)
+		if err = r.Client.Delete(context.TODO(), installDs); err != nil {
+			return err
+		}
+	} else if !k8serrors.IsNotFound(err) {
+		return err
+	}
+
+	uninstallDs, err := r.daemonSetForLiteConfig(UninstallKata)
+	if err != nil {
+		return err
+	}
+
+	foundDs := &appsv1.DaemonSet{}
+	err = r.Client.Get(context.TODO(), types.NamespacedName{
+		Name:      uninstallDs.Name,
+		Namespace: uninstallDs.Namespace,
+	}, foundDs)
+
+	if k8serrors.IsNotFound(err) {
+		r.Log.Info("Creating osc-lite uninstall daemonset", "Name", uninstallDs.Name)
+		if err = controllerutil.SetControllerReference(r.kataConfig, uninstallDs, r.Scheme); err != nil {
+			return err
+		}
+		return r.Client.Create(context.TODO(), uninstallDs)
+	}
+
+	return err
+}
+
+// daemonSetForLiteConfig creates a DaemonSet for osc-lite binary and config deployment.
+func (r *KataConfigOpenShiftReconciler) daemonSetForLiteConfig(action KataDaemonSetAction) (*appsv1.DaemonSet, error) {
+	var (
+		runPrivileged       = true
+		runAsUser     int64 = 0
+		nodeSelector        = r.getNodeSelectorAsMap()
+	)
+
+	name := liteInstallDaemonSetName + "-" + string(action)
+	daemonsetLabelSelectors := map[string]string{
+		"name": name,
+	}
+
+	volumeMounts := r.volumeMountsForRegistries()
+	volumes := r.volumesForRegistries()
+
+	return &appsv1.DaemonSet{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "apps/v1",
+			Kind:       "DaemonSet",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: OperatorNamespace,
+		},
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: daemonsetLabelSelectors,
+			},
+			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{
+				Type: "RollingUpdate",
+				RollingUpdate: &appsv1.RollingUpdateDaemonSet{
+					MaxUnavailable: &intstr.IntOrString{
+						Type:   intstr.Int,
+						IntVal: 1,
+					},
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: daemonsetLabelSelectors,
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "default",
+					NodeSelector:       nodeSelector,
+					HostPID:            true,
+					Containers: []corev1.Container{
+						{
+							Name:            "lite-install",
+							Image:           liteDaemonSetImage,
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: &runPrivileged,
+								RunAsUser:  &runAsUser,
+							},
+							Command: []string{"/bin/bash", "/scripts/osc-krun-install.sh"},
+							Args:    []string{string(action)},
+							Env: []corev1.EnvVar{
+								{
+									Name: "NODE_NAME",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "spec.nodeName",
+										},
+									},
+								},
+								{
+									Name:  "KRUN_IMAGE",
+									Value: liteDefaultImage,
+								},
+							},
+							VolumeMounts: volumeMounts,
+						},
+					},
+					Volumes: volumes,
+				},
+			},
+		},
+	}, nil
 }

@@ -92,6 +92,10 @@ const (
 	kataNvidiaGPURuntimeClassName        = "kata-nvidia-gpu"
 	kataNvidiaGPURuntimeClassCpuOverhead = "1"
 	kataNvidiaGPURuntimeClassMemOverhead = "4096Mi"
+
+	liteRuntimeClassName        = "osc-lite"
+	liteRuntimeClassCpuOverhead = "0.1"
+	liteRuntimeClassMemOverhead = "128Mi"
 )
 
 var (
@@ -1199,6 +1203,19 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 	err = r.deleteDaemonsetForMonitor()
 	if err != nil {
 		return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 15}, err
+	}
+
+	// Clean up osc-lite if it was enabled
+	fgStatus, fgErr := r.NewFeatureGateStatus()
+	if fgErr == nil && fgStatus.EnableLite {
+		r.Log.Info("Removing lite deployment")
+		if err := r.removeLiteConfigDaemonSet(); err != nil {
+			r.Log.Error(err, "failed to remove lite config daemonset")
+			return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
+		}
+		if err := r.deleteRuntimeClass(liteRuntimeClassName); err != nil {
+			r.Log.Error(err, "failed to delete lite runtime class")
+		}
 	}
 
 	if r.kataConfig.Spec.EnablePeerPods {
@@ -2382,5 +2399,21 @@ func (r *KataConfigOpenShiftReconciler) postKataInstallation() (*ctrl.Result, er
 			return res, err
 		}
 	}
+
+	// deploy osc-lite if feature gate is enabled
+	fgStatus, fgErr := r.NewFeatureGateStatus()
+	if fgErr == nil && fgStatus.EnableLite {
+		r.Log.Info("lite feature gate is enabled, deploying osc-lite")
+		if err := r.addLiteConfigDaemonSet(); err != nil {
+			r.Log.Error(err, "failed to create lite config daemonset")
+			return &ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
+		}
+		if err := r.createRuntimeClass(liteRuntimeClassName, liteRuntimeClassCpuOverhead, liteRuntimeClassMemOverhead, "", liteRuntimeClassName, nil); err != nil {
+			r.Log.Error(err, "failed to create lite runtime class")
+			return &ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
+		}
+		r.Log.Info("lite deployment complete")
+	}
+
 	return nil, nil
 }

@@ -14,18 +14,21 @@ const (
 	ConfidentialFeatureGate = "confidential"
 	LayeredImageDeployment  = "layeredImageDeployment"
 	DeploymentModeConfig    = "deploymentMode"
+	EnableLiteFeatureGate   = "enableLite"
 )
 
 var DefaultFeatureGates = FeatureGateStatus{
 	Confidential:           false,
 	LayeredImageDeployment: false,
 	DeploymentModeOption:   MachineConfigOption,
+	EnableLite:             false,
 }
 
 type FeatureGateStatus struct {
 	Confidential           bool
 	LayeredImageDeployment bool
 	DeploymentModeOption   DeploymentModeOption
+	EnableLite             bool
 }
 
 // Create enum to represent the state of the feature gates
@@ -48,6 +51,7 @@ func (r *KataConfigOpenShiftReconciler) NewFeatureGateStatus() (*FeatureGateStat
 		Confidential:           DefaultFeatureGates.Confidential,
 		LayeredImageDeployment: DefaultFeatureGates.LayeredImageDeployment,
 		DeploymentModeOption:   DefaultFeatureGates.DeploymentModeOption,
+		EnableLite:             DefaultFeatureGates.EnableLite,
 	}
 
 	cfgMap := &corev1.ConfigMap{}
@@ -70,6 +74,14 @@ func (r *KataConfigOpenShiftReconciler) NewFeatureGateStatus() (*FeatureGateStat
 				fgStatus.LayeredImageDeployment = layeredImageDeployment
 			}
 		}
+		if value, ok := cfgMap.Data[EnableLiteFeatureGate]; ok {
+			enableLite, err := strconv.ParseBool(value)
+			if err != nil {
+				r.Log.Info("Couldn't parse enableLite status, using default value", "default", DefaultFeatureGates.EnableLite, "error", err)
+			} else {
+				fgStatus.EnableLite = enableLite
+			}
+		}
 		if value, ok := cfgMap.Data[DeploymentModeConfig]; ok {
 			mode, err := ParseDeploymentModeOption(value)
 			if err != nil {
@@ -90,6 +102,7 @@ func (r *KataConfigOpenShiftReconciler) NewFeatureGateStatus() (*FeatureGateStat
 var statusChecker = map[string]func(fgstatus *FeatureGateStatus) bool{
 	ConfidentialFeatureGate: func(fgstatus *FeatureGateStatus) bool { return fgstatus.Confidential },
 	LayeredImageDeployment:  func(fgstatus *FeatureGateStatus) bool { return fgstatus.LayeredImageDeployment },
+	EnableLiteFeatureGate:   func(fgstatus *FeatureGateStatus) bool { return fgstatus.EnableLite },
 }
 
 func (fgstatus *FeatureGateStatus) IsEnabled(key string) bool {

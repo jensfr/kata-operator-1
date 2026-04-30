@@ -1,0 +1,4 @@
+[crio.runtime.runtimes.osc-lite]
+runtime_path = "/usr/local/bin/krun"
+runtime_type = "oci"
+runtime_root = "/run/krun"
