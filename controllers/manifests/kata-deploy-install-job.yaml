@@ -1,0 +1,357 @@
+# Standalone staged installation Job for kata-deploy with downstream
+# Red Hat artifacts. Derived from upstream kata-deploy 4.1.0 chart.
+#
+# This Job runs on one named node. The operator creates one per target node.
+#
+# Architecture:
+#   The combined kata-deploy image contains the unchanged upstream installer
+#   binary AND our downstream Red Hat tarballs (QEMU, libs, firmware,
+#   osbuilder, kata-agent, boot service, guest config).
+#   install-stage-artifacts installs them directly. No overlay step.
+#
+# Images:
+#   combined: quay.io/jensfr/osc-kata-deploy@sha256:18ab8c571b8123482af95eab941def467531a17675766b774fed35ca4be68e25
+#     Upstream kata-deploy 4.1.0 binary (distroless) + Red Hat artifact tarball.
+#     Used for kata-deploy binary stages: host-check, install-artifacts, configure-cri.
+#   helper:  quay.io/jensfr/osc-helper@sha256:ea1eeb97d480b84ce5b5d4103346daf06c27246112b517adbbb537ff0fe60c85
+#     Shell-capable UBI9 image for host-integration stages that use /bin/sh + chroot.
+#     Used for: selinux-install, guest-prep, apply-labels.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kata-install-placeholder
+  namespace: placeholder
+  labels:
+    app: kata-install
+    kata.io/target-node: placeholder
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: kata-install
+        kata.io/target-node: placeholder
+    spec:
+      nodeName: placeholder
+      restartPolicy: Never
+      serviceAccountName: kata-install
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+
+      initContainers:
+      # Stage 1: Host prerequisite check
+      - name: host-check
+        image: quay.io/jensfr/osc-kata-deploy@sha256:18ab8c571b8123482af95eab941def467531a17675766b774fed35ca4be68e25
+        command: ["/usr/bin/kata-deploy", "install-stage-host-check"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: CONTAINER_RUNTIME_VERSION
+          value: "placeholder"
+        - name: DAEMONSET_NAME
+          value: kata-install
+        - name: SHIMS_X86_64
+          value: "qemu"
+        - name: DEFAULT_SHIM_X86_64
+          value: "qemu"
+        - name: K8S_DISTRIBUTION
+          value: "k8s"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: kata-install
+          mountPath: /opt/kata
+        - name: boot
+          mountPath: /boot
+          readOnly: true
+
+      # Stage 2: Install SELinux file-context mapping package
+      - name: selinux-install
+        image: quay.io/jensfr/osc-helper@sha256:ea1eeb97d480b84ce5b5d4103346daf06c27246112b517adbbb537ff0fe60c85
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          cp /selinux/osc_kata_deploy.pp /host/tmp/osc_kata_deploy.pp
+          chroot /host semodule -i /tmp/osc_kata_deploy.pp
+          rm -f /host/tmp/osc_kata_deploy.pp
+          echo "SELinux module installed"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+        - name: selinux
+          mountPath: /selinux
+
+      # Stage 3: Install artifacts (upstream kata-deploy extracts our tarballs)
+      - name: install-artifacts
+        image: quay.io/jensfr/osc-kata-deploy@sha256:18ab8c571b8123482af95eab941def467531a17675766b774fed35ca4be68e25
+        command: ["/usr/bin/kata-deploy", "install-stage-artifacts"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: CONTAINER_RUNTIME_VERSION
+          value: "placeholder"
+        - name: DAEMONSET_NAME
+          value: kata-install
+        - name: SHIMS_X86_64
+          value: "qemu"
+        - name: DEFAULT_SHIM_X86_64
+          value: "qemu"
+        - name: K8S_DISTRIBUTION
+          value: "k8s"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: kata-install
+          mountPath: /opt/kata
+        - name: crio-conf
+          mountPath: /etc/crio/
+        - name: containerd-conf
+          mountPath: /etc/containerd/
+        - name: systemd-system
+          mountPath: /etc/systemd/system
+        - name: boot
+          mountPath: /boot
+          readOnly: true
+        - name: host-machine-id
+          mountPath: /host-machine-id
+          readOnly: true
+        - name: host-run-lock
+          mountPath: /host-run-lock
+        - name: host-usr-bin
+          mountPath: /host-usr/bin
+          readOnly: true
+        - name: host-usr-sbin
+          mountPath: /host-usr/sbin
+          readOnly: true
+
+      # Stage 4: Generate host-derived guest artifacts and install boot service
+      - name: guest-prep
+        image: quay.io/jensfr/osc-helper@sha256:ea1eeb97d480b84ce5b5d4103346daf06c27246112b517adbbb537ff0fe60c85
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          KATA_DIR=/var/opt/kata
+          OSBUILDER="${KATA_DIR}/libexec/kata-containers/osbuilder/kata-osbuilder.sh"
+          UNIT_SRC="${KATA_DIR}/share/systemd/osc-kata-guest-prep.service"
+          HOST_UNIT_DIR=/etc/systemd/system
+
+          echo "=== OSC guest preparation ==="
+
+          # Verify required artifacts were installed by install-stage-artifacts
+          chroot /host test -x "${OSBUILDER}" || \
+            { echo "FATAL: osbuilder not found at ${OSBUILDER}"; exit 1; }
+          chroot /host test -x "${KATA_DIR}/libexec/kata-containers/agent/usr/bin/kata-agent" || \
+            { echo "FATAL: kata-agent not found"; exit 1; }
+          chroot /host test -f "${UNIT_SRC}" || \
+            { echo "FATAL: boot service template not found at ${UNIT_SRC}"; exit 1; }
+
+          echo "Running kata-osbuilder.sh..."
+          chroot /host env \
+            KATA_LIBEXEC_DIR="${KATA_DIR}/libexec/kata-containers" \
+            "${OSBUILDER}" -c -u
+
+          # Verify guest artifacts were generated
+          chroot /host test -e /var/cache/kata-containers/osbuilder-images/kata.kernel || \
+            { echo "FATAL: kata.kernel not generated"; exit 1; }
+          chroot /host test -e /var/cache/kata-containers/osbuilder-images/kata.initrd || \
+            { echo "FATAL: kata.initrd not generated"; exit 1; }
+          echo "kata.kernel -> $(chroot /host readlink -f /var/cache/kata-containers/osbuilder-images/kata.kernel)"
+          echo "kata.initrd exists: $(chroot /host ls -lh /var/cache/kata-containers/osbuilder-images/kata.initrd | awk '{print $5}')"
+
+          # Install and enable boot-time regeneration unit (offline, for next boot)
+          cp "/host${UNIT_SRC}" "/host${HOST_UNIT_DIR}/osc-kata-guest-prep.service"
+          mkdir -p "/host${HOST_UNIT_DIR}/kubelet.service.wants"
+          ln -sf "${HOST_UNIT_DIR}/osc-kata-guest-prep.service" \
+            "/host${HOST_UNIT_DIR}/kubelet.service.wants/osc-kata-guest-prep.service"
+          echo "Boot-time regeneration unit installed and enabled."
+
+          # Patch kata config to reference host-derived guest paths
+          CONF="${KATA_DIR}/share/defaults/kata-containers/runtimes/qemu/configuration-qemu.toml"
+          chroot /host test -f "$CONF" || \
+            { echo "FATAL: kata config not found at $CONF"; exit 1; }
+
+          chroot /host sed -i \
+            -e 's|^kernel = ".*"|kernel = "/var/cache/kata-containers/osbuilder-images/kata.kernel"|' \
+            -e 's|^image = ".*"|initrd = "/var/cache/kata-containers/osbuilder-images/kata.initrd"|' \
+            "$CONF"
+          chroot /host sed -i '/^image = /d' "$CONF"
+          echo "Kata config patched to use host-derived guest paths."
+
+          echo "=== Guest preparation complete ==="
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+
+      # Stage 5: Apply SELinux labels and verify complete installation
+      - name: apply-labels
+        image: quay.io/jensfr/osc-helper@sha256:ea1eeb97d480b84ce5b5d4103346daf06c27246112b517adbbb537ff0fe60c85
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+
+          # Apply SELinux labels to all kata paths including guest artifacts
+          chroot /host restorecon -F -R /var/opt/kata/
+          chroot /host restorecon -F -R /var/cache/kata-containers/
+          echo "Labels applied"
+
+          # Verify SELinux contexts on key paths
+          for f in \
+            /var/opt/kata/bin/qemu-system-x86_64 \
+            /var/opt/kata/bin/qemu-system-x86_64.real \
+            /var/opt/kata/libexec/virtiofsd \
+            /var/opt/kata/share/qemu-kvm/bios-256k.bin \
+            /var/cache/kata-containers/osbuilder-images/kata.kernel \
+            /var/cache/kata-containers/osbuilder-images/kata.initrd; do
+            chroot /host matchpathcon -V "$f" 2>&1
+          done
+          echo "SELinux labels verified"
+
+          # Verify guest artifacts exist
+          chroot /host test -e /var/cache/kata-containers/osbuilder-images/kata.kernel || \
+            { echo "FATAL: kata.kernel missing after label pass"; exit 1; }
+          chroot /host test -e /var/cache/kata-containers/osbuilder-images/kata.initrd || \
+            { echo "FATAL: kata.initrd missing after label pass"; exit 1; }
+          echo "Guest artifacts verified"
+
+          # Verify kata config references host-derived guest paths
+          CONF="/var/opt/kata/share/defaults/kata-containers/runtimes/qemu/configuration-qemu.toml"
+          chroot /host test -f "$CONF" || \
+            { echo "FATAL: kata config not found at $CONF"; exit 1; }
+
+          chroot /host grep -Fq \
+            'kernel = "/var/cache/kata-containers/osbuilder-images/kata.kernel"' \
+            "$CONF" || \
+            { echo "FATAL: kata config does not reference host-derived kernel"; exit 1; }
+
+          chroot /host grep -Fq \
+            'initrd = "/var/cache/kata-containers/osbuilder-images/kata.initrd"' \
+            "$CONF" || \
+            { echo "FATAL: kata config does not reference host-derived initrd"; exit 1; }
+
+          if chroot /host grep -Eq '^[[:space:]]*image[[:space:]]*=' "$CONF"; then
+            echo "FATAL: image= still active in kata config"
+            exit 1
+          fi
+          echo "Kata config verified: host-derived kernel + initrd, no image="
+
+          # Verify boot service WantedBy symlink exists
+          HOST_UNIT_DIR=/etc/systemd/system
+          test -L "/host${HOST_UNIT_DIR}/kubelet.service.wants/osc-kata-guest-prep.service" || \
+            { echo "FATAL: boot service not enabled"; exit 1; }
+          echo "Boot service verified"
+          echo "Boot service verified"
+
+          echo "=== All verifications passed ==="
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+
+      containers:
+      # Stage 6: Configure and activate CRI-O
+      - name: configure-cri
+        image: quay.io/jensfr/osc-kata-deploy@sha256:18ab8c571b8123482af95eab941def467531a17675766b774fed35ca4be68e25
+        command: ["/usr/bin/kata-deploy", "install-stage-cri"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: CONTAINER_RUNTIME_VERSION
+          value: "placeholder"
+        - name: DAEMONSET_NAME
+          value: kata-install
+        - name: SHIMS_X86_64
+          value: "qemu"
+        - name: DEFAULT_SHIM_X86_64
+          value: "qemu"
+        - name: K8S_DISTRIBUTION
+          value: "k8s"
+        - name: HEALTH_PORT
+          value: "0"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: kata-install
+          mountPath: /opt/kata
+        - name: crio-conf
+          mountPath: /etc/crio/
+        - name: containerd-conf
+          mountPath: /etc/containerd/
+        - name: systemd-system
+          mountPath: /etc/systemd/system
+        - name: systemd-private
+          mountPath: /run/systemd/private
+        - name: host-machine-id
+          mountPath: /host-machine-id
+          readOnly: true
+        - name: host-run-lock
+          mountPath: /host-run-lock
+        - name: host-usr-bin
+          mountPath: /host-usr/bin
+          readOnly: true
+        - name: host-usr-sbin
+          mountPath: /host-usr/sbin
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+      - name: kata-install
+        hostPath:
+          path: /opt/kata
+          type: DirectoryOrCreate
+      - name: crio-conf
+        hostPath:
+          path: /etc/crio/
+      - name: containerd-conf
+        hostPath:
+          path: /etc/containerd/
+      - name: systemd-system
+        hostPath:
+          path: /etc/systemd/system
+          type: DirectoryOrCreate
+      - name: systemd-private
+        hostPath:
+          path: /run/systemd/private
+          type: Socket
+      - name: boot
+        hostPath:
+          path: /boot
+      - name: host-machine-id
+        hostPath:
+          path: /etc/machine-id
+          type: File
+      - name: host-run-lock
+        hostPath:
+          path: /run/lock
+          type: DirectoryOrCreate
+      - name: host-usr-bin
+        hostPath:
+          path: /usr/bin
+      - name: host-usr-sbin
+        hostPath:
+          path: /usr/sbin
+      - name: selinux
+        configMap:
+          name: selinux-module
+      - name: tmp
+        emptyDir: {}

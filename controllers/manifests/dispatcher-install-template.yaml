@@ -1,0 +1,307 @@
+# Node-agnostic per-node install Job template for k8s-job-dispatcher.
+#
+# Upstream stages derived from the pinned Kata HEAD (26c2e163) golden
+# render. OSC stages inserted between upstream prerequisite and mutation
+# phases. Images are placeholders replaced by the controller.
+#
+# The dispatcher injects: metadata.name, spec.nodeName,
+# CONTAINER_RUNTIME_VERSION, NODE_MACHINE_ID.
+#
+# Pipeline:
+#   load-kernel-modules -> host-check -> [OSC selinux] -> artifacts
+#   -> [OSC guest-prep] -> [OSC restorecon-verify] -> cri
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    kata-deploy/stage: install
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        kata-deploy/stage: install
+    spec:
+      automountServiceAccountToken: false
+      serviceAccountName: kata-install
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      priorityClassName: "system-node-critical"
+      tolerations:
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+      - key: node.kubernetes.io/disk-pressure
+        operator: Exists
+        effect: NoSchedule
+      - key: node.kubernetes.io/memory-pressure
+        operator: Exists
+        effect: NoSchedule
+      - key: node.kubernetes.io/pid-pressure
+        operator: Exists
+        effect: NoSchedule
+      - key: node.kubernetes.io/unschedulable
+        operator: Exists
+        effect: NoSchedule
+
+      initContainers:
+      # --- Upstream stage 0: load-kernel-modules (privileged) ---
+      - name: load-kernel-modules
+        image: COMBINED_IMAGE
+        command: ["/usr/bin/kata-deploy", "install-stage-load-kernel-modules"]
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: DAEMONSET_NAME
+          value: kata-install
+        - name: SHIMS_X86_64
+          value: "qemu"
+        - name: DEFAULT_SHIM_X86_64
+          value: "qemu"
+        - name: K8S_DISTRIBUTION
+          value: "k8s"
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+        - {name: crio-conf, mountPath: /etc/crio/}
+        - {name: containerd-conf, mountPath: /etc/containerd/}
+        - {name: kata-install, mountPath: /opt/kata}
+        - {name: systemd-system, mountPath: /etc/systemd/system}
+        - {name: systemd-private, mountPath: /run/systemd/private}
+        - {name: boot, mountPath: /boot, readOnly: true}
+        - {name: host-machine-id, mountPath: /host-machine-id, readOnly: true}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+        - {name: host-usr-bin, mountPath: /host-usr/bin, readOnly: true}
+        - {name: host-usr-sbin, mountPath: /host-usr/sbin, readOnly: true}
+        - {name: host-usr-local-bin, mountPath: /host-usr-local/bin, readOnly: true}
+        - {name: host-usr-local-sbin, mountPath: /host-usr-local/sbin, readOnly: true}
+        - {name: host-bin, mountPath: /host-bin, readOnly: true}
+        - {name: host-sbin, mountPath: /host-sbin, readOnly: true}
+        - {name: host-root, mountPath: /host, readOnly: true}
+        - {name: modules-load-d, mountPath: /host-modules-load.d}
+
+      # --- Upstream stage 1: host-check (non-mutating, no privilege needed) ---
+      - name: host-check
+        image: COMBINED_IMAGE
+        command: ["/usr/bin/kata-deploy", "install-stage-host-check"]
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: DAEMONSET_NAME
+          value: kata-install
+        - name: SHIMS_X86_64
+          value: "qemu"
+        - name: DEFAULT_SHIM_X86_64
+          value: "qemu"
+        - name: K8S_DISTRIBUTION
+          value: "k8s"
+        securityContext:
+          privileged: false
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+        - {name: crio-conf, mountPath: /etc/crio/}
+        - {name: containerd-conf, mountPath: /etc/containerd/}
+        - {name: kata-install, mountPath: /opt/kata}
+        - {name: systemd-system, mountPath: /etc/systemd/system}
+        - {name: systemd-private, mountPath: /run/systemd/private}
+        - {name: boot, mountPath: /boot, readOnly: true}
+        - {name: host-machine-id, mountPath: /host-machine-id, readOnly: true}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+        - {name: host-usr-bin, mountPath: /host-usr/bin, readOnly: true}
+        - {name: host-usr-sbin, mountPath: /host-usr/sbin, readOnly: true}
+        - {name: host-usr-local-bin, mountPath: /host-usr-local/bin, readOnly: true}
+        - {name: host-usr-local-sbin, mountPath: /host-usr-local/sbin, readOnly: true}
+        - {name: host-bin, mountPath: /host-bin, readOnly: true}
+        - {name: host-sbin, mountPath: /host-sbin, readOnly: true}
+
+      # --- OSC: install SELinux file-context mappings ---
+      - name: selinux-install
+        image: HELPER_IMAGE
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          exec 9>/host-run-lock/kata-deploy.lock
+          flock -x 9
+          cp /selinux/osc_kata_deploy.pp /host/tmp/osc_kata_deploy.pp
+          chroot /host semodule -i /tmp/osc_kata_deploy.pp
+          rm -f /host/tmp/osc_kata_deploy.pp
+          echo "SELinux module installed"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - {name: host-root, mountPath: /host}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+        - {name: selinux, mountPath: /selinux}
+
+      # --- Upstream stage 2: artifacts ---
+      # Upstream uses privileged:false with a companion SELinux allow policy
+      # granting container_t write on var_lock_t and other host paths.
+      # OSC uses mapping-only SELinux (no allow rules for container_t), so
+      # host-mutating stages run privileged under the dedicated kata-install SCC.
+      - name: artifacts
+        image: COMBINED_IMAGE
+        command: ["/usr/bin/kata-deploy", "install-stage-artifacts"]
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: DAEMONSET_NAME
+          value: kata-install
+        - name: SHIMS_X86_64
+          value: "qemu"
+        - name: DEFAULT_SHIM_X86_64
+          value: "qemu"
+        - name: K8S_DISTRIBUTION
+          value: "k8s"
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+        - {name: crio-conf, mountPath: /etc/crio/}
+        - {name: containerd-conf, mountPath: /etc/containerd/}
+        - {name: kata-install, mountPath: /opt/kata}
+        - {name: systemd-system, mountPath: /etc/systemd/system}
+        - {name: systemd-private, mountPath: /run/systemd/private}
+        - {name: boot, mountPath: /boot, readOnly: true}
+        - {name: host-machine-id, mountPath: /host-machine-id, readOnly: true}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+        - {name: host-usr-bin, mountPath: /host-usr/bin, readOnly: true}
+        - {name: host-usr-sbin, mountPath: /host-usr/sbin, readOnly: true}
+        - {name: host-usr-local-bin, mountPath: /host-usr-local/bin, readOnly: true}
+        - {name: host-usr-local-sbin, mountPath: /host-usr-local/sbin, readOnly: true}
+        - {name: host-bin, mountPath: /host-bin, readOnly: true}
+        - {name: host-sbin, mountPath: /host-sbin, readOnly: true}
+
+      # --- OSC: generate host-derived guest kernel/initrd ---
+      - name: guest-prep
+        image: HELPER_IMAGE
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          exec 9>/host-run-lock/kata-deploy.lock
+          flock -x 9
+          KATA_DIR=/var/opt/kata
+          OSBUILDER="${KATA_DIR}/libexec/kata-containers/osbuilder/kata-osbuilder.sh"
+          UNIT_SRC="${KATA_DIR}/share/systemd/osc-kata-guest-prep.service"
+          HOST_UNIT_DIR=/etc/systemd/system
+          chroot /host test -x "${OSBUILDER}" || { echo "FATAL: osbuilder missing"; exit 1; }
+          chroot /host test -x "${KATA_DIR}/libexec/kata-containers/agent/usr/bin/kata-agent" || { echo "FATAL: agent missing"; exit 1; }
+          chroot /host test -f "${UNIT_SRC}" || { echo "FATAL: boot service missing"; exit 1; }
+          chroot /host env KATA_LIBEXEC_DIR="${KATA_DIR}/libexec/kata-containers" "${OSBUILDER}" -c -u
+          chroot /host test -e /var/cache/kata-containers/osbuilder-images/kata.kernel || { echo "FATAL: kernel"; exit 1; }
+          chroot /host test -e /var/cache/kata-containers/osbuilder-images/kata.initrd || { echo "FATAL: initrd"; exit 1; }
+          cp "/host${UNIT_SRC}" "/host${HOST_UNIT_DIR}/osc-kata-guest-prep.service"
+          mkdir -p "/host${HOST_UNIT_DIR}/kubelet.service.wants"
+          ln -sf "${HOST_UNIT_DIR}/osc-kata-guest-prep.service" "/host${HOST_UNIT_DIR}/kubelet.service.wants/osc-kata-guest-prep.service"
+          CONF="${KATA_DIR}/share/defaults/kata-containers/runtimes/qemu/configuration-qemu.toml"
+          chroot /host test -f "$CONF" || { echo "FATAL: config missing"; exit 1; }
+          chroot /host sed -i \
+            -e 's|^kernel = ".*"|kernel = "/var/cache/kata-containers/osbuilder-images/kata.kernel"|' \
+            -e 's|^image = ".*"|initrd = "/var/cache/kata-containers/osbuilder-images/kata.initrd"|' "$CONF"
+          chroot /host sed -i '/^image = /d' "$CONF"
+          echo "Guest prep complete"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - {name: host-root, mountPath: /host}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+
+      # --- OSC: apply SELinux labels and verify ---
+      - name: restorecon-verify
+        image: HELPER_IMAGE
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          exec 9>/host-run-lock/kata-deploy.lock
+          flock -x 9
+          chroot /host restorecon -F -R /var/opt/kata/
+          chroot /host restorecon -F -R /var/cache/kata-containers/
+          HOST_UNIT_DIR=/etc/systemd/system
+          test -L "/host${HOST_UNIT_DIR}/kubelet.service.wants/osc-kata-guest-prep.service" || \
+            { echo "FATAL: boot service not enabled"; exit 1; }
+          CONF="/var/opt/kata/share/defaults/kata-containers/runtimes/qemu/configuration-qemu.toml"
+          chroot /host test -f "$CONF" || { echo "FATAL: kata config missing"; exit 1; }
+          chroot /host grep -Fq \
+            'kernel = "/var/cache/kata-containers/osbuilder-images/kata.kernel"' "$CONF" || \
+            { echo "FATAL: kernel path wrong"; exit 1; }
+          echo "All verifications passed"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - {name: host-root, mountPath: /host}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+
+      containers:
+      # --- Upstream stage 3: cri ---
+      # Same OSC privilege adaptation as artifacts (mapping-only SELinux).
+      - name: cri
+        image: COMBINED_IMAGE
+        command: ["/usr/bin/kata-deploy", "install-stage-cri"]
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: DAEMONSET_NAME
+          value: kata-install
+        - name: SHIMS_X86_64
+          value: "qemu"
+        - name: DEFAULT_SHIM_X86_64
+          value: "qemu"
+        - name: K8S_DISTRIBUTION
+          value: "k8s"
+        - name: HEALTH_PORT
+          value: "0"
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+        - {name: crio-conf, mountPath: /etc/crio/}
+        - {name: containerd-conf, mountPath: /etc/containerd/}
+        - {name: kata-install, mountPath: /opt/kata}
+        - {name: systemd-system, mountPath: /etc/systemd/system}
+        - {name: systemd-private, mountPath: /run/systemd/private}
+        - {name: boot, mountPath: /boot, readOnly: true}
+        - {name: host-machine-id, mountPath: /host-machine-id, readOnly: true}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+        - {name: host-usr-bin, mountPath: /host-usr/bin, readOnly: true}
+        - {name: host-usr-sbin, mountPath: /host-usr/sbin, readOnly: true}
+        - {name: host-usr-local-bin, mountPath: /host-usr-local/bin, readOnly: true}
+        - {name: host-usr-local-sbin, mountPath: /host-usr-local/sbin, readOnly: true}
+        - {name: host-bin, mountPath: /host-bin, readOnly: true}
+        - {name: host-sbin, mountPath: /host-sbin, readOnly: true}
+
+      volumes:
+      - {name: tmp, emptyDir: {}}
+      - {name: crio-conf, hostPath: {path: /etc/crio/}}
+      - {name: containerd-conf, hostPath: {path: /etc/containerd/}}
+      - {name: kata-install, hostPath: {path: /opt/kata, type: DirectoryOrCreate}}
+      - {name: systemd-system, hostPath: {path: /etc/systemd/system, type: DirectoryOrCreate}}
+      - {name: systemd-private, hostPath: {path: /run/systemd/private, type: Socket}}
+      - {name: boot, hostPath: {path: /boot}}
+      - {name: host-machine-id, hostPath: {path: /etc/machine-id, type: File}}
+      - {name: host-run-lock, hostPath: {path: /run/lock, type: DirectoryOrCreate}}
+      - {name: host-usr-bin, hostPath: {path: /usr/bin}}
+      - {name: host-usr-sbin, hostPath: {path: /usr/sbin}}
+      - {name: host-usr-local-bin, hostPath: {path: /usr/local/bin, type: DirectoryOrCreate}}
+      - {name: host-usr-local-sbin, hostPath: {path: /usr/local/sbin, type: DirectoryOrCreate}}
+      - {name: host-bin, hostPath: {path: /bin}}
+      - {name: host-sbin, hostPath: {path: /sbin}}
+      - {name: modules-load-d, hostPath: {path: /etc/modules-load.d, type: DirectoryOrCreate}}
+      - {name: host-root, hostPath: {path: /}}
+      - name: selinux
+        configMap:
+          name: selinux-module

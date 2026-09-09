@@ -1,0 +1,9 @@
+kata-runtime:
+  version: "3.31.0"
+  source: "konflux"
+qemu:
+  version: "from-rhel"
+  source: "rhel-9.4-repos"
+virtiofsd:
+  version: "from-rhel"
+  source: "rhel-9.4-repos"
