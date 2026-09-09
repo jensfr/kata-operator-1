@@ -253,6 +253,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "RuntimeClass")
 		os.Exit(1)
 	}
+	if err = (&controllers.KataNodeCoverageReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Log:    ctrl.Log.WithName("controllers").WithName("KataNodeCoverage"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "KataNodeCoverage")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := controllers.RegisterOscMetricsCollector(mgr); err != nil {

@@ -108,6 +108,23 @@ var (
 	}
 )
 
+type kataDeployRuntime struct {
+	Shim    string
+	Handler string
+}
+
+var defaultKataDeployRuntime = kataDeployRuntime{
+	Shim:    "qemu",
+	Handler: "kata-qemu",
+}
+
+func (r *KataConfigOpenShiftReconciler) kataRuntimeHandler() string {
+	if r.DeploymentMode == KataDeployMode {
+		return defaultKataDeployRuntime.Handler
+	}
+	return kataRuntimeClassName
+}
+
 // +kubebuilder:rbac:groups=kataconfiguration.openshift.io,resources=kataconfigs;kataconfigs/finalizers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kataconfiguration.openshift.io,resources=kataconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments;daemonsets;replicasets;statefulsets,verbs=get;list;watch;create;update;patch;delete
@@ -196,6 +213,8 @@ func (r *KataConfigOpenShiftReconciler) Reconcile(ctx context.Context, req ctrl.
 				res, err = r.processKataConfigDeleteRequest()
 			case DaemonSetMode:
 				res, err = r.processKataConfigDeleteRequestDaemonSet()
+			case KataDeployMode:
+				res, err = r.processKataConfigDeleteRequestKataDeploy()
 			default:
 				res = ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}
 				err = fmt.Errorf("unknown deployment mode: %d", r.DeploymentMode)
@@ -222,6 +241,8 @@ func (r *KataConfigOpenShiftReconciler) Reconcile(ctx context.Context, req ctrl.
 			res, err = r.processKataConfigInstallRequest()
 		case DaemonSetMode:
 			res, err = r.processKataConfigInstallRequestDaemonSet()
+		case KataDeployMode:
+			res, err = r.processKataConfigInstallRequestDispatcher()
 		default:
 			res = ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}
 			err = fmt.Errorf("unknown deployment mode: %d", r.DeploymentMode)
@@ -959,7 +980,6 @@ func (r *KataConfigOpenShiftReconciler) createRuntimeClass(
 
 		nodeSelector := r.getNodeSelectorAsMap()
 
-		// Add additional node label if provided
 		if r.kataConfig.Spec.CheckNodeEligibility && additionalNodeLabels != nil {
 			maps.Copy(nodeSelector, additionalNodeLabels)
 		}
@@ -997,6 +1017,148 @@ func (r *KataConfigOpenShiftReconciler) createRuntimeClass(
 	}
 
 	return nil
+}
+
+// ensureRuntimeClass creates a RuntimeClass or replaces it if the handler
+// differs. Handler is immutable in Kubernetes, so replacement is a two-phase
+// delete/requeue/create lifecycle. Returns true when replacement is pending
+// and the caller should requeue.
+func (r *KataConfigOpenShiftReconciler) ensureRuntimeClass(
+	runtimeClassName string,
+	cpuOverhead string,
+	memoryOverhead string,
+	handler string,
+	nodeSelector map[string]string) (replacementPending bool, err error) {
+
+	foundRc := &nodeapi.RuntimeClass{}
+	err = r.Client.Get(context.TODO(), types.NamespacedName{Name: runtimeClassName}, foundRc)
+
+	if k8serrors.IsNotFound(err) {
+		desiredRC := r.buildRuntimeClass(runtimeClassName, cpuOverhead, memoryOverhead, handler, nodeSelector)
+		if err := controllerutil.SetControllerReference(r.kataConfig, desiredRC, r.Scheme); err != nil {
+			return false, err
+		}
+		r.Log.Info("Creating RuntimeClass", "rc.Name", runtimeClassName, "handler", handler)
+		if err := r.Client.Create(context.TODO(), desiredRC); err != nil {
+			return false, fmt.Errorf("error creating %s: %w", runtimeClassName, err)
+		}
+		if !contains(r.kataConfig.Status.RuntimeClasses, runtimeClassName) {
+			r.kataConfig.Status.RuntimeClasses = append(r.kataConfig.Status.RuntimeClasses, runtimeClassName)
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	if foundRc.DeletionTimestamp != nil {
+		r.Log.Info("RuntimeClass is terminating, waiting", "rc.Name", runtimeClassName)
+		return true, nil
+	}
+
+	// Handler is immutable; mismatch requires delete/recreate.
+	if foundRc.Handler != handler {
+		r.Log.Info("RuntimeClass handler mismatch, requesting replacement",
+			"rc.Name", runtimeClassName, "current", foundRc.Handler, "desired", handler)
+		r.removeFromRuntimeClassStatus(runtimeClassName)
+		if err := r.Client.Delete(context.TODO(), foundRc); err != nil {
+			return false, fmt.Errorf("error deleting %s for handler replacement: %w", runtimeClassName, err)
+		}
+		return true, nil
+	}
+
+	// Reconcile mutable fields: Scheduling and Overhead.
+	desiredScheduling := &nodeapi.Scheduling{NodeSelector: nodeSelector}
+	desiredOverhead := &nodeapi.Overhead{
+		PodFixed: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpuOverhead),
+			corev1.ResourceMemory: resource.MustParse(memoryOverhead),
+		},
+	}
+
+	needsUpdate := false
+	if foundRc.Scheduling == nil || !maps.Equal(foundRc.Scheduling.NodeSelector, nodeSelector) {
+		foundRc.Scheduling = desiredScheduling
+		needsUpdate = true
+	}
+	if foundRc.Overhead == nil || !foundRc.Overhead.PodFixed.Cpu().Equal(*desiredOverhead.PodFixed.Cpu()) ||
+		!foundRc.Overhead.PodFixed.Memory().Equal(*desiredOverhead.PodFixed.Memory()) {
+		foundRc.Overhead = desiredOverhead
+		needsUpdate = true
+	}
+
+	if needsUpdate {
+		if err := r.Client.Update(context.TODO(), foundRc); err != nil {
+			return false, fmt.Errorf("error updating %s: %w", runtimeClassName, err)
+		}
+		r.Log.Info("Updated RuntimeClass", "rc.Name", runtimeClassName)
+	}
+
+	if !contains(r.kataConfig.Status.RuntimeClasses, runtimeClassName) {
+		r.kataConfig.Status.RuntimeClasses = append(r.kataConfig.Status.RuntimeClasses, runtimeClassName)
+	}
+	return false, nil
+}
+
+func (r *KataConfigOpenShiftReconciler) buildRuntimeClass(
+	name, cpuOverhead, memoryOverhead, handler string,
+	nodeSelector map[string]string) *nodeapi.RuntimeClass {
+	return &nodeapi.RuntimeClass{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "node.k8s.io/v1",
+			Kind:       "RuntimeClass",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       name,
+			Finalizers: []string{runtimeClassFinalizerName},
+		},
+		Handler: handler,
+		Overhead: &nodeapi.Overhead{
+			PodFixed: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(cpuOverhead),
+				corev1.ResourceMemory: resource.MustParse(memoryOverhead),
+			},
+		},
+		Scheduling: &nodeapi.Scheduling{
+			NodeSelector: nodeSelector,
+		},
+	}
+}
+
+func (r *KataConfigOpenShiftReconciler) ensureRuntimeClassAbsent(name string) (replacementPending bool, err error) {
+	rc := &nodeapi.RuntimeClass{}
+	err = r.Client.Get(context.TODO(), types.NamespacedName{Name: name}, rc)
+
+	if k8serrors.IsNotFound(err) {
+		r.removeFromRuntimeClassStatus(name)
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+
+	r.removeFromRuntimeClassStatus(name)
+
+	if rc.DeletionTimestamp != nil {
+		return true, nil
+	}
+
+	r.Log.Info("Removing unsupported RuntimeClass", "rc.Name", name)
+	if err := r.Client.Delete(context.TODO(), rc); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (r *KataConfigOpenShiftReconciler) removeFromRuntimeClassStatus(name string) {
+	filtered := make([]string, 0, len(r.kataConfig.Status.RuntimeClasses))
+	for _, rc := range r.kataConfig.Status.RuntimeClasses {
+		if rc != name {
+			filtered = append(filtered, rc)
+		}
+	}
+	r.kataConfig.Status.RuntimeClasses = filtered
 }
 
 func (r *KataConfigOpenShiftReconciler) deleteRuntimeClass(runtimeClassName string) error {
@@ -1664,13 +1826,27 @@ type NodeEventHandler struct {
 	reconciler *KataConfigOpenShiftReconciler
 }
 
+func (eh *NodeEventHandler) isRelevantNode(node client.Object) bool {
+	r := eh.reconciler
+	if r.DeploymentMode != KataDeployMode {
+		return isWorkerNode(node)
+	}
+	if r.kataConfig == nil {
+		return false
+	}
+	if r.nodeMatchesKataSelector(node.GetLabels()) {
+		return true
+	}
+	return node.GetAnnotations()[annManagedBy] == string(r.kataConfig.UID)
+}
+
 func (eh *NodeEventHandler) Create(ctx context.Context, event event.CreateEvent, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	node := event.Object
 
 	log := eh.reconciler.Log.WithName("NodeCreate").WithValues("node name", node.GetName())
 	log.Info("node created")
 
-	if !isWorkerNode(node) {
+	if !eh.isRelevantNode(node) {
 		return
 	}
 
@@ -1687,14 +1863,12 @@ func (eh *NodeEventHandler) Create(ctx context.Context, event event.CreateEvent,
 }
 
 func (eh *NodeEventHandler) Update(ctx context.Context, event event.UpdateEvent, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-	// This function assumes that a node cannot change its role from master to
-	// worker or vice-versa.
 	nodeOld := event.ObjectOld
 	nodeNew := event.ObjectNew
 
 	log := eh.reconciler.Log.WithName("NodeUpdate").WithValues("node name", nodeNew.GetName())
 
-	if !isWorkerNode(nodeNew) {
+	if !eh.isRelevantNode(nodeOld) && !eh.isRelevantNode(nodeNew) {
 		return
 	}
 
@@ -1747,6 +1921,11 @@ func (eh *NodeEventHandler) Update(ctx context.Context, event event.UpdateEvent,
 }
 
 func (eh *NodeEventHandler) Delete(ctx context.Context, event event.DeleteEvent, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+	node := event.Object
+	if eh.isRelevantNode(node) {
+		eh.reconciler.Log.WithName("NodeDelete").Info("relevant node deleted", "node name", node.GetName())
+		queue.Add(eh.reconciler.makeReconcileRequest())
+	}
 }
 
 func (eh *NodeEventHandler) Generic(ctx context.Context, event event.GenericEvent, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
@@ -2357,25 +2536,34 @@ func (r *KataConfigOpenShiftReconciler) deleteScc() error {
 
 func (r *KataConfigOpenShiftReconciler) postKataInstallation() (*ctrl.Result, error) {
 	r.Log.Info("create runtime class")
-	r.resetInProgressCondition()
 
-	// creating kata runtime class if node labels exist
-	err := r.createRuntimeClass(
+	// Ensure kata RuntimeClass with the correct handler and scheduling.
+	pending, err := r.ensureRuntimeClass(
 		kataRuntimeClassName,
 		kataRuntimeClassCpuOverhead,
 		kataRuntimeClassMemOverhead,
-		"",                   /* nil extended resource overhead */
-		kataRuntimeClassName, /* reused for handler */
+		r.kataRuntimeHandler(),
 		map[string]string{
-			"feature.node.kubernetes.io/runtime.kata": "true",
+			kataRuntimeLabel: "true",
 		})
 	if err != nil {
 		return &ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
 	}
+	if pending {
+		return &ctrl.Result{Requeue: true, RequeueAfter: 2 * time.Second}, nil
+	}
 
-	// creating kata-nvidia-gpu runtime class if node labels exist
-	// Skip GPU runtime classes on s390x architecture as NVIDIA GPUs are not supported
-	if goruntime.GOARCH != "s390x" {
+	if r.DeploymentMode == KataDeployMode {
+		// KataDeployMode installs only kata-qemu. Remove stale GPU
+		// RuntimeClass if one was left by a previous legacy install.
+		pending, err = r.ensureRuntimeClassAbsent(kataNvidiaGPURuntimeClassName)
+		if err != nil {
+			return &ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
+		}
+		if pending {
+			return &ctrl.Result{Requeue: true, RequeueAfter: 2 * time.Second}, nil
+		}
+	} else if goruntime.GOARCH != "s390x" {
 		err = r.createRuntimeClass(
 			kataNvidiaGPURuntimeClassName,
 			kataNvidiaGPURuntimeClassCpuOverhead,
@@ -2410,5 +2598,7 @@ func (r *KataConfigOpenShiftReconciler) postKataInstallation() (*ctrl.Result, er
 			return res, err
 		}
 	}
+
+	r.resetInProgressCondition()
 	return nil, nil
 }

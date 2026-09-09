@@ -12,21 +12,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// Create enum to represent the state of the deployment mode
 type DeploymentMode int
 
 const (
 	MachineConfigMode DeploymentMode = iota
 	DaemonSetMode
+	KataDeployMode
 )
 
-// Create enum to represent the configuration of the deployment mode
 type DeploymentModeOption string
 
 const (
-	MachineConfigOption     DeploymentModeOption = "MachineConfig"
-	DaemonSetOption         DeploymentModeOption = "DaemonSet"
-	DaemonSetFallbackOption DeploymentModeOption = "DaemonSetFallback"
+	MachineConfigOption      DeploymentModeOption = "MachineConfig"
+	DaemonSetOption          DeploymentModeOption = "DaemonSet"
+	DaemonSetFallbackOption  DeploymentModeOption = "DaemonSetFallback"
+	KataDeployOption         DeploymentModeOption = "KataDeploy"
+	KataDeployFallbackOption DeploymentModeOption = "KataDeployFallback"
 )
 
 const (
@@ -38,7 +39,8 @@ const (
 
 func ParseDeploymentModeOption(s string) (DeploymentModeOption, error) {
 	switch DeploymentModeOption(s) {
-	case MachineConfigOption, DaemonSetOption, DaemonSetFallbackOption:
+	case MachineConfigOption, DaemonSetOption, DaemonSetFallbackOption,
+		KataDeployOption, KataDeployFallbackOption:
 		return DeploymentModeOption(s), nil
 	default:
 		return "", fmt.Errorf("invalid DeploymentMode: %q", s)
@@ -81,6 +83,23 @@ func (r *KataConfigOpenShiftReconciler) handleDeploymentModeFeature(mode Deploym
 	if mode == DaemonSetOption {
 		r.Log.Info("Deployment mode will be set to DaemonSet")
 		r.DeploymentMode = DaemonSetMode
+		return nil
+	}
+
+	if mode == KataDeployOption {
+		r.Log.Info("Deployment mode will be set to KataDeploy")
+		r.DeploymentMode = KataDeployMode
+		return nil
+	}
+
+	if mode == KataDeployFallbackOption {
+		if machineConfigAvailable {
+			r.Log.Info("Deployment mode will be set to MachineConfig")
+			r.DeploymentMode = MachineConfigMode
+		} else {
+			r.Log.Info("MachineConfig is not available, deployment mode will be set to KataDeploy")
+			r.DeploymentMode = KataDeployMode
+		}
 		return nil
 	}
 
