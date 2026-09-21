@@ -1,0 +1,124 @@
+# Combined kata-deploy image: unchanged upstream installer + Red Hat artifacts.
+#
+# Build: requires entitlement certs + kata-containers RPM as local inputs.
+# podman build --platform linux/amd64 \
+#   -v ~/.osc-build-secrets/entitlement.pem:/etc/pki/entitlement/entitlement.pem:ro \
+#   -v ~/.osc-build-secrets/entitlement-key.pem:/etc/pki/entitlement/entitlement-key.pem:ro \
+#   -v ~/.osc-build-secrets/kata-containers.rpm:/build-inputs/kata-containers.rpm:ro \
+#   -t quay.io/jensfr/osc-kata-deploy:v2 \
+#   -f Containerfile .
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build Red Hat artifact tarballs
+# ---------------------------------------------------------------------------
+FROM registry.redhat.io/ubi9/ubi:9.6 AS artifact-builder
+
+# RHEL packages
+RUN dnf install -y --nodocs \
+    qemu-kvm-core qemu-kvm-common qemu-img virtiofsd \
+    edk2-ovmf seabios-bin seavgabios-bin ipxe-roms-qemu \
+    capstone daxctl-libs ndctl-libs pixman libpmem libpng libfdt librdmacm \
+    zstd && dnf clean all
+
+# kata-containers RPM (provides osbuilder + kata-agent)
+# Mounted at build time via: -v ~/.osc-build-secrets/kata-containers.rpm:/build-inputs/kata-containers.rpm:ro
+RUN test -f /build-inputs/kata-containers.rpm || \
+      { echo "FATAL: kata-containers.rpm not mounted at /build-inputs/"; exit 1; } && \
+    dnf install -y --nodocs /build-inputs/kata-containers.rpm && \
+    echo "kata-containers installed: $(rpm -q kata-containers)"
+
+# --- Verify required inputs exist ---
+RUN set -e && \
+    test -x /usr/libexec/kata-containers/osbuilder/kata-osbuilder.sh || \
+      { echo "FATAL: osbuilder script missing"; exit 1; } && \
+    test -x /usr/libexec/kata-containers/agent/usr/bin/kata-agent || \
+      { echo "FATAL: kata-agent missing"; exit 1; } && \
+    test -f /usr/lib/systemd/system/kata-osbuilder-generate.service || \
+      { echo "FATAL: boot service missing"; exit 1; } && \
+    echo "All required kata-containers inputs verified"
+
+# --- Stage QEMU, wrapper, private libraries ---
+RUN set -e && \
+    mkdir -p /s/opt/kata/{bin,lib,libexec/kata-containers,share/qemu-kvm,share/edk2,share/systemd,share/defaults/kata-containers} && \
+    QEMU=$(rpm -ql qemu-kvm-core | grep "qemu-kvm$" | head -1) && \
+    cp "$QEMU" /s/opt/kata/bin/qemu-system-x86_64.real && \
+    printf '#!/bin/sh\nset -eu\nexport LD_LIBRARY_PATH=/var/opt/kata/lib\nexec /var/opt/kata/bin/qemu-system-x86_64.real "$@"\n' \
+      > /s/opt/kata/bin/qemu-system-x86_64 && chmod +x /s/opt/kata/bin/qemu-system-x86_64 && \
+    cp /usr/bin/qemu-img /s/opt/kata/bin/qemu-img.real && \
+    printf '#!/bin/sh\nset -eu\nexport LD_LIBRARY_PATH=/var/opt/kata/lib\nexec /var/opt/kata/bin/qemu-img.real "$@"\n' \
+      > /s/opt/kata/bin/qemu-img && chmod +x /s/opt/kata/bin/qemu-img && \
+    cp /usr/libexec/virtiofsd /s/opt/kata/libexec/
+
+RUN set -e && \
+    for lib in libcapstone.so.4 libdaxctl.so.1 libndctl.so.6 libpixman-1.so.0 \
+               libpmem.so.1 libpng16.so.16 libfdt.so.1 librdmacm.so.1; do \
+      src=$(ldconfig -p | grep "	$lib " | awk '{print $NF}' | head -1); \
+      [ -n "$src" ] && cp -L "$src" /s/opt/kata/lib/$lib || { echo "FATAL: $lib missing"; exit 1; }; \
+    done
+
+# --- Firmware ---
+RUN set -e && \
+    cp /usr/share/qemu-kvm/*.bin /s/opt/kata/share/qemu-kvm/ 2>/dev/null || true && \
+    cp /usr/share/ipxe/qemu/efi-*.rom /s/opt/kata/share/qemu-kvm/ 2>/dev/null || true && \
+    cp /usr/share/seabios/bios-256k.bin /s/opt/kata/share/qemu-kvm/ && \
+    cp /usr/share/seavgabios/vgabios-*.bin /s/opt/kata/share/qemu-kvm/ && \
+    [ -d /usr/share/qemu-kvm/keymaps ] && cp -r /usr/share/qemu-kvm/keymaps /s/opt/kata/share/qemu-kvm/ && \
+    cp -r /usr/share/edk2/ovmf /s/opt/kata/share/edk2/
+
+# --- Osbuilder and kata-agent ---
+# Make KATA_LIBEXEC_DIR overridable for relocation under /var/opt/kata
+RUN set -e && \
+    cp -r /usr/libexec/kata-containers/osbuilder /s/opt/kata/libexec/kata-containers/ && \
+    cp -r /usr/libexec/kata-containers/agent /s/opt/kata/libexec/kata-containers/ && \
+    PATCHED=$(sed -n 's|^KATA_LIBEXEC_DIR="/usr/libexec/kata-containers"|KATA_LIBEXEC_DIR="${KATA_LIBEXEC_DIR:-/usr/libexec/kata-containers}"|p' \
+      /s/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh | wc -l) && \
+    sed -i 's|^KATA_LIBEXEC_DIR="/usr/libexec/kata-containers"|KATA_LIBEXEC_DIR="${KATA_LIBEXEC_DIR:-/usr/libexec/kata-containers}"|' \
+      /s/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh && \
+    [ "$PATCHED" -eq 1 ] || { echo "FATAL: KATA_LIBEXEC_DIR patch expected 1 match, got $PATCHED"; exit 1; } && \
+    echo "osbuilder KATA_LIBEXEC_DIR made overridable (1 match patched)"
+
+# --- Boot-time regeneration unit (OSC-owned, with correct paths and ordering) ---
+RUN cat > /s/opt/kata/share/systemd/osc-kata-guest-prep.service <<'UNIT'
+[Unit]
+Description=OSC: Generate Kata guest image for host kernel
+Before=kubelet.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+Environment=KATA_LIBEXEC_DIR=/var/opt/kata/libexec/kata-containers
+ExecStart=/var/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh -c -u
+
+[Install]
+WantedBy=kubelet.service
+UNIT
+
+# --- Downstream kata configuration ---
+# Reference host-derived guest paths. These are stable product paths,
+# not host-dependent. Guest-prep generates the artifacts at these locations.
+RUN set -e && \
+    CONF_DIR="/s/opt/kata/share/defaults/kata-containers" && \
+    printf '[hypervisor.qemu]\nkernel = "/var/cache/kata-containers/osbuilder-images/kata.kernel"\ninitrd = "/var/cache/kata-containers/osbuilder-images/kata.initrd"\n' \
+      > "$CONF_DIR/osc-guest-paths.toml"
+
+# --- Verify staged payload ---
+RUN set -e && \
+    test -x /s/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh && \
+    test -x /s/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
+    test -f /s/opt/kata/share/systemd/osc-kata-guest-prep.service && \
+    test -x /s/opt/kata/bin/qemu-system-x86_64.real && \
+    test -x /s/opt/kata/libexec/virtiofsd && \
+    echo "All staged payloads verified"
+
+# --- Create tarball ---
+RUN cd /s && mkdir -p /artifacts && \
+    tar cf - opt/kata | zstd -o /artifacts/kata-static-qemu.tar.zst && \
+    echo "Tarball: $(ls -lh /artifacts/kata-static-qemu.tar.zst | awk '{print $5}')"
+
+# ---------------------------------------------------------------------------
+# Stage 2: Combine with upstream kata-deploy
+# ---------------------------------------------------------------------------
+FROM quay.io/kata-containers/kata-deploy:4.1.0
+
+COPY --from=artifact-builder /artifacts/kata-static-qemu.tar.zst \
+     /opt/kata-artifacts/tarballs/kata-static-qemu.tar.zst

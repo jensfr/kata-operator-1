@@ -1,0 +1,173 @@
+# osc-artifacts: Red Hat kata artifacts for use with upstream kata-deploy.
+#
+# Assembles dynamically linked RHEL QEMU and its dependencies into
+# tarballs that the unchanged upstream kata-deploy installer extracts.
+# Tarballs use the opt/kata/ prefix that kata-deploy strips on extraction.
+#
+# Library resolution mechanism is determined separately (milestone 2c).
+# This Containerfile produces unmodified RPM binaries.
+#
+# Requires entitlement certs mounted at /etc/pki/entitlement/ for
+# RHEL repo access when building on UBI.
+
+# ---------------------------------------------------------------------------
+# Stage 1: Install QEMU, firmware, and private dependencies from RHEL repos
+# ---------------------------------------------------------------------------
+FROM registry.redhat.io/ubi9/ubi:9.6 AS builder
+
+RUN dnf install -y --nodocs \
+    qemu-kvm-core \
+    qemu-kvm-common \
+    qemu-img \
+    virtiofsd \
+    edk2-ovmf \
+    seabios-bin \
+    seavgabios-bin \
+    ipxe-roms-qemu \
+    capstone \
+    daxctl-libs \
+    ndctl-libs \
+    pixman \
+    libpmem \
+    libpng \
+    libfdt \
+    librdmacm \
+    zstd \
+    && dnf clean all
+
+# ---------------------------------------------------------------------------
+# Stage QEMU binary and private libraries
+# ---------------------------------------------------------------------------
+# The real QEMU binary is at .real; a minimal wrapper sets the
+# private library path and execs into it. This keeps the RPM payload
+# byte-identical and covers the full transitive dependency chain
+# (libpmem -> libndctl -> libdaxctl) without modifying any library.
+RUN set -e && \
+    mkdir -p /staging/opt/kata/bin /staging/opt/kata/lib && \
+    QEMU=$(rpm -ql qemu-kvm-core | grep "qemu-kvm$" | head -1) && \
+    [ -n "$QEMU" ] || { echo "FATAL: qemu-kvm binary not found"; exit 1; } && \
+    cp "$QEMU" /staging/opt/kata/bin/qemu-system-x86_64.real && \
+    printf '#!/bin/sh\nset -eu\nexport LD_LIBRARY_PATH=/var/opt/kata/lib\nexec /var/opt/kata/bin/qemu-system-x86_64.real "$@"\n' \
+      > /staging/opt/kata/bin/qemu-system-x86_64 && \
+    chmod +x /staging/opt/kata/bin/qemu-system-x86_64 && \
+    cp /usr/bin/qemu-img /staging/opt/kata/bin/qemu-img.real && \
+    printf '#!/bin/sh\nset -eu\nexport LD_LIBRARY_PATH=/var/opt/kata/lib\nexec /var/opt/kata/bin/qemu-img.real "$@"\n' \
+      > /staging/opt/kata/bin/qemu-img && \
+    chmod +x /staging/opt/kata/bin/qemu-img
+
+# Private libraries: only those missing from RHCOS.
+# Every library must resolve. Fedora packages are rejected.
+RUN set -e && \
+    FAIL=0 && \
+    for lib in \
+      libcapstone.so.4 \
+      libdaxctl.so.1 \
+      libndctl.so.6 \
+      libpixman-1.so.0 \
+      libpmem.so.1 \
+      libpng16.so.16 \
+      libfdt.so.1 \
+      librdmacm.so.1; do \
+      src=$(ldconfig -p | grep "	$lib " | awk '{print $NF}' | head -1); \
+      if [ -n "$src" ] && [ -f "$src" ]; then \
+        pkg=$(rpm -qf "$src" 2>/dev/null || echo "unknown"); \
+        if echo "$pkg" | grep -q '\.fc[0-9]'; then \
+          echo "FATAL: $lib from Fedora ($pkg), not RHEL"; FAIL=1; \
+        else \
+          cp -L "$src" /staging/opt/kata/lib/$lib; \
+          echo "OK: $lib -> $pkg"; \
+        fi; \
+      else \
+        echo "FATAL: $lib not found"; FAIL=1; \
+      fi; \
+    done && \
+    [ $FAIL -eq 0 ] || exit 1
+
+# ---------------------------------------------------------------------------
+# Stage virtiofsd
+# ---------------------------------------------------------------------------
+RUN mkdir -p /staging/opt/kata/libexec && \
+    cp /usr/libexec/virtiofsd /staging/opt/kata/libexec/
+
+# ---------------------------------------------------------------------------
+# Stage firmware into QEMU's relative data directory
+# RHEL QEMU looks in <binary>/../share/qemu-kvm/ by default.
+# With the binary at opt/kata/bin/, that resolves to opt/kata/share/qemu-kvm/.
+# ---------------------------------------------------------------------------
+RUN set -e && \
+    mkdir -p /staging/opt/kata/share/qemu-kvm && \
+    # qemu-kvm-common: boot ROMs and helpers
+    for f in /usr/share/qemu-kvm/*.bin /usr/share/qemu-kvm/*.rom; do \
+      [ -f "$f" ] && cp "$f" /staging/opt/kata/share/qemu-kvm/; \
+    done && \
+    # ipxe-roms-qemu: PXE/EFI network boot ROMs
+    for f in /usr/share/ipxe/qemu/efi-*.rom; do \
+      [ -f "$f" ] && cp "$f" /staging/opt/kata/share/qemu-kvm/; \
+    done && \
+    # seabios
+    cp /usr/share/seabios/bios-256k.bin /staging/opt/kata/share/qemu-kvm/ && \
+    # seavgabios
+    cp /usr/share/seavgabios/vgabios-*.bin /staging/opt/kata/share/qemu-kvm/ && \
+    # edk2-ovmf
+    mkdir -p /staging/opt/kata/share/edk2 && \
+    cp -r /usr/share/edk2/ovmf /staging/opt/kata/share/edk2/ && \
+    # keymaps
+    [ -d /usr/share/qemu-kvm/keymaps ] && \
+      cp -r /usr/share/qemu-kvm/keymaps /staging/opt/kata/share/qemu-kvm/ && \
+    echo "Firmware staged:" && \
+    ls /staging/opt/kata/share/qemu-kvm/ | head -20
+
+# ---------------------------------------------------------------------------
+# Generate dependency manifest
+# ---------------------------------------------------------------------------
+RUN set -e && \
+    cat > /staging/opt/kata/MANIFEST <<EOF
+# osc-artifacts dependency manifest
+# All runtime components from Red Hat RPMs. No Fedora packages.
+qemu: $(rpm -q qemu-kvm-core)
+qemu-common: $(rpm -q qemu-kvm-common)
+virtiofsd: $(rpm -q virtiofsd)
+librdmacm: $(rpm -q librdmacm)
+edk2-ovmf: $(rpm -q edk2-ovmf)
+seabios: $(rpm -q seabios-bin)
+seavgabios: $(rpm -q seavgabios-bin)
+ipxe: $(rpm -q ipxe-roms-qemu)
+arch: x86_64
+build_date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+note: Unmodified RPM binaries. Library resolution mechanism TBD.
+EOF
+    echo "" >> /staging/opt/kata/MANIFEST && \
+    echo "# Private libraries" >> /staging/opt/kata/MANIFEST && \
+    for f in /staging/opt/kata/lib/*.so*; do \
+      [ -f "$f" ] || continue; \
+      n=$(basename "$f"); \
+      s=$(sha256sum "$f" | awk '{print $1}'); \
+      p=$(rpm -qf "$(ldconfig -p | grep "	$n " | awk '{print $NF}' | head -1)" 2>/dev/null || echo "?"); \
+      echo "  $n: rpm=$p sha256=$s" >> /staging/opt/kata/MANIFEST; \
+    done && \
+    echo "" >> /staging/opt/kata/MANIFEST && \
+    echo "# Executables" >> /staging/opt/kata/MANIFEST && \
+    for f in /staging/opt/kata/bin/* /staging/opt/kata/libexec/*; do \
+      [ -f "$f" ] || continue; \
+      n=$(basename "$f"); \
+      s=$(sha256sum "$f" | awk '{print $1}'); \
+      echo "  $n: sha256=$s" >> /staging/opt/kata/MANIFEST; \
+    done && \
+    cat /staging/opt/kata/MANIFEST
+
+# ---------------------------------------------------------------------------
+# Create tarball
+# ---------------------------------------------------------------------------
+RUN mkdir -p /opt/kata-artifacts/tarballs && \
+    cd /staging && \
+    tar cf - opt/kata | zstd -o /opt/kata-artifacts/tarballs/kata-static-qemu.tar.zst && \
+    ls -lh /opt/kata-artifacts/tarballs/
+
+# ---------------------------------------------------------------------------
+# Stage 2: Final image
+# ---------------------------------------------------------------------------
+FROM scratch
+
+COPY --from=builder /opt/kata-artifacts/ /opt/kata-artifacts/
+COPY shim-components.json /opt/kata-artifacts/
+COPY versions.yaml /opt/kata-artifacts/

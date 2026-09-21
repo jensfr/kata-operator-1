@@ -1,0 +1,44 @@
+{
+  "shims": {
+    "qemu": {
+      "tarballs": [
+        "kata-static-kata-runtime.tar.zst",
+        "kata-static-qemu.tar.zst",
+        "kata-static-virtiofsd.tar.zst",
+        "kata-static-firmware.tar.zst",
+        "kata-static-kata-osbuilder.tar.zst",
+        "kata-static-selinux.tar.zst",
+        "kata-static-crio-dropin.tar.zst"
+      ]
+    },
+    "qemu-tdx": {
+      "tarballs": [
+        "kata-static-kata-runtime.tar.zst",
+        "kata-static-qemu.tar.zst",
+        "kata-static-virtiofsd.tar.zst",
+        "kata-static-firmware.tar.zst",
+        "kata-static-selinux.tar.zst",
+        "kata-static-crio-dropin.tar.zst"
+      ]
+    },
+    "qemu-snp": {
+      "tarballs": [
+        "kata-static-kata-runtime.tar.zst",
+        "kata-static-qemu.tar.zst",
+        "kata-static-virtiofsd.tar.zst",
+        "kata-static-firmware.tar.zst",
+        "kata-static-selinux.tar.zst",
+        "kata-static-crio-dropin.tar.zst"
+      ]
+    },
+    "qemu-se": {
+      "tarballs": [
+        "kata-static-kata-runtime.tar.zst",
+        "kata-static-qemu.tar.zst",
+        "kata-static-virtiofsd.tar.zst",
+        "kata-static-selinux.tar.zst",
+        "kata-static-crio-dropin.tar.zst"
+      ]
+    }
+  }
+}
