@@ -79,6 +79,8 @@ RUN set -eu && \
     cp -r /kata-src/tools/osbuilder/dracut /kata-out/osbuilder/ && \
     cp -r /kata-src/tools/osbuilder/initrd-builder /kata-out/osbuilder/ && \
     cp -r /kata-src/tools/osbuilder/image-builder /kata-out/osbuilder/ && \
+    cp -r /kata-src/tools/osbuilder/rootfs-builder /kata-out/osbuilder/ && \
+    cp -r /kata-src/tools/osbuilder/scripts /kata-out/osbuilder/ && \
     cp /kata-src/tools/osbuilder/VERSION /kata-out/osbuilder/ && \
     cp /kata-src/tools/osbuilder/Makefile /kata-out/osbuilder/
 
@@ -193,6 +195,8 @@ RUN set -eu && \
     test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh && \
     test -d /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/dracut && \
     test -d /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/initrd-builder && \
+    test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/rootfs-builder/rootfs.sh && \
+    test -f /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/scripts/lib.sh && \
     test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
     test -s /c/shim-v2-go/opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \
     test -L /c/shim-v2-go/opt/kata/share/defaults/kata-containers/configuration.toml && \
@@ -223,6 +227,8 @@ RUN set -eu && \
     test -f opt/kata/lib/libcapstone.so.4 && \
     test -x opt/kata/libexec/virtiofsd && \
     test -x opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh && \
+    test -x opt/kata/libexec/kata-containers/osbuilder/rootfs-builder/rootfs.sh && \
+    test -f opt/kata/libexec/kata-containers/osbuilder/scripts/lib.sh && \
     test -x opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
     test -f opt/kata/share/systemd/osc-kata-guest-prep.service && \
     ! grep -rq '@[A-Z].*@' opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \

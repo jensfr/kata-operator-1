@@ -30,7 +30,7 @@ readonly RUNTIME_CLASSES=( \
 
 DEFAULT_KATA_ARG_DIR="/tmp/kata-containers"
 HOST_KERNEL_PATH=""
-KATA_LIBEXEC_DIR="/usr/libexec/kata-containers"
+KATA_LIBEXEC_DIR="${KATA_LIBEXEC_DIR:-/usr/libexec/kata-containers}"
 
 ARG_AGENT_DIR_PREFIX=""
 ARG_EXIT_IF_IMAGES_INSTALLED=""
