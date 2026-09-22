@@ -1,5 +1,5 @@
 shim-v2-go:
-  source: "kata-containers upstream source"
+  source: "kata-containers upstream source (Go build)"
   ref: "4.2.0"
   components: "containerd-shim-kata-v2, kata-runtime, kata-collect-data.sh, configuration-qemu.toml"
 qemu:
@@ -9,10 +9,10 @@ virtiofsd:
   source: "RHEL 9 RPMs"
   components: "virtiofsd"
 osc-guest-support:
-  source: "kata-containers upstream source + OSC"
-  ref: "4.2.0"
-  components: "osbuilder, kata-agent (musl static), osc-kata-guest-prep.service"
+  agent-source: "osc-podvm-payload Konflux build"
+  osbuilder-source: "kata-containers upstream source + OSC kata-osbuilder.sh"
+  components: "kata-agent, osbuilder, dracut config, osc-kata-guest-prep.service"
 kata-deploy:
-  source: "kata-containers upstream source"
+  source: "kata-containers upstream"
   ref: "4.2.0"
   note: "installer binary only; built separately in osc-kata-deploy"
