@@ -1,66 +1,66 @@
 # osc-kata-artifacts: Complete Red Hat kata payload for upstream kata-deploy.
 #
-# Builds kata-containers components from pinned upstream source.
+# Shim and runtime are built from pinned kata-containers source (Go).
+# kata-agent comes from the existing osc-podvm-payload Konflux build.
 # QEMU, virtiofsd, firmware, and private libraries come from RHEL RPMs.
 #
 # Produces /opt/kata-artifacts/ with four component tarballs:
-#   kata-static-shim-v2-go.tar.zst       - shim, runtime, config (from source)
-#   kata-static-qemu.tar.zst             - QEMU, libs, firmware (from RHEL RPMs)
-#   kata-static-virtiofsd.tar.zst        - virtiofsd (from RHEL RPMs)
-#   kata-static-osc-guest-support.tar.zst - osbuilder, agent, boot svc (from source)
+#   kata-static-shim-v2-go.tar.zst       - shim, runtime, config (Go source build)
+#   kata-static-qemu.tar.zst             - QEMU, libs, firmware (RHEL RPMs)
+#   kata-static-virtiofsd.tar.zst        - virtiofsd (RHEL RPMs)
+#   kata-static-osc-guest-support.tar.zst - osbuilder, agent, boot svc
 #
 # Build:
 #   podman build --platform linux/amd64 \
 #     --secret id=entitlement-key,src=~/.osc-build-secrets/entitlement-key.pem \
 #     --secret id=entitlement,src=~/.osc-build-secrets/entitlement.pem \
 #     --build-arg KATA_SOURCE_REF=4.2.0 \
+#     --build-arg PODVM_PAYLOAD_IMAGE=<osc-podvm-payload@digest> \
 #     -f Containerfile \
 #     -t quay.io/openshift_sandboxed_containers/osc-kata-artifacts:latest .
 
 ARG KATA_SOURCE_REF=4.2.0
 ARG GO_VERSION=1.26.7
-ARG RUST_VERSION=1.96.0
+ARG PODVM_PAYLOAD_IMAGE
 
 # ---------------------------------------------------------------------------
-# Stage 1: Build kata-containers from source (Go + Rust)
+# Stage 1: Extract kata-agent from existing Konflux build
+# ---------------------------------------------------------------------------
+FROM ${PODVM_PAYLOAD_IMAGE} AS podvm-payload
+
+RUN set -eu && \
+    mkdir -p /agent-out/usr/bin && \
+    tar xf /podvm-binaries.tar.gz -C /tmp && \
+    cp /tmp/usr/local/bin/kata-agent /agent-out/usr/bin/kata-agent && \
+    test -x /agent-out/usr/bin/kata-agent
+
+# ---------------------------------------------------------------------------
+# Stage 2: Build shim and runtime from kata-containers source (Go only)
 # ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi:9.6 AS kata-builder
 
 ARG KATA_SOURCE_REF
 ARG GO_VERSION
-ARG RUST_VERSION
 
-RUN dnf install -y --nodocs git gcc gcc-c++ make protobuf-compiler \
+RUN --mount=type=secret,id=entitlement-key,dst=/etc/pki/entitlement/entitlement-key.pem \
+    --mount=type=secret,id=entitlement,dst=/etc/pki/entitlement/entitlement.pem \
+    dnf install -y --nodocs git gcc gcc-c++ make \
     libseccomp-devel glib2-devel && dnf clean all
 
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | \
     tar -C /usr/local -xzf - && \
     ln -s /usr/local/go/bin/go /usr/local/bin/go
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain ${RUST_VERSION} && \
-    ln -s /root/.cargo/bin/cargo /usr/local/bin/cargo && \
-    ln -s /root/.cargo/bin/rustc /usr/local/bin/rustc
-
 RUN git clone --depth 1 --branch ${KATA_SOURCE_REF} \
     https://github.com/kata-containers/kata-containers.git /kata-src
 
-# Build containerd-shim-kata-v2, kata-runtime, and generated configs
+# Build shim and runtime (also generates configuration-qemu.toml)
 RUN set -eu && cd /kata-src/src/runtime && \
     PREFIX=/opt/kata PREFIXDEPS=/opt/kata \
-    make containerd-shim-kata-v2 kata-runtime \
-         config/configuration-qemu.toml && \
+    make containerd-shim-v2 runtime && \
     mkdir -p /kata-out/bin && \
     cp containerd-shim-kata-v2 /kata-out/bin/ && \
     cp kata-runtime /kata-out/bin/
-
-# Build kata-agent (static musl binary for guest initrd)
-RUN set -eu && \
-    /root/.cargo/bin/rustup target add x86_64-unknown-linux-musl && \
-    cd /kata-src/src/agent && \
-    make LIBC=musl && \
-    mkdir -p /kata-out/agent/usr/bin && \
-    cp target/x86_64-unknown-linux-musl/release/kata-agent /kata-out/agent/usr/bin/
 
 # Copy generated config and tools
 RUN set -eu && \
@@ -73,7 +73,7 @@ RUN set -eu && \
     cp /kata-src/src/runtime/data/kata-collect-data.sh /kata-out/bin/ && \
     chmod +x /kata-out/bin/kata-collect-data.sh
 
-# Copy upstream osbuilder components (dracut modules, initrd-builder, image-builder)
+# Copy upstream osbuilder components
 RUN set -eu && \
     mkdir -p /kata-out/osbuilder && \
     cp -r /kata-src/tools/osbuilder/dracut /kata-out/osbuilder/ && \
@@ -85,7 +85,7 @@ RUN set -eu && \
     cp /kata-src/tools/osbuilder/Makefile /kata-out/osbuilder/
 
 # ---------------------------------------------------------------------------
-# Stage 2: RHEL components (QEMU, virtiofsd, firmware, libraries)
+# Stage 3: RHEL components (QEMU, virtiofsd, firmware, libraries)
 # ---------------------------------------------------------------------------
 FROM registry.redhat.io/ubi9/ubi:9.6 AS rhel-builder
 
@@ -131,13 +131,14 @@ RUN set -eu && \
     cp /usr/libexec/virtiofsd /c/virtiofsd/opt/kata/libexec/
 
 # ---------------------------------------------------------------------------
-# Stage 3: Assemble tarballs
+# Stage 4: Assemble tarballs
 # ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS assembler
 
 RUN microdnf install -y zstd tar && microdnf clean all
 
 COPY --from=kata-builder /kata-out/ /kata-out/
+COPY --from=podvm-payload /agent-out/ /kata-out/agent/
 COPY --from=rhel-builder /c/ /c/
 
 # OSC-owned guest builder and downstream dracut config
@@ -145,7 +146,7 @@ COPY osc-guest-support/kata-osbuilder.sh /kata-out/osbuilder/kata-osbuilder.sh
 COPY osc-guest-support/dracut.conf.d/15-dracut.conf /kata-out/osbuilder/dracut/dracut.conf.d/15-dracut.conf
 RUN chmod +x /kata-out/osbuilder/kata-osbuilder.sh
 
-# Component 1: shim-v2-go (from source build)
+# Component 1: shim-v2-go (from Go source build)
 RUN set -eu && \
     mkdir -p /c/shim-v2-go/opt/kata/bin \
              /c/shim-v2-go/opt/kata/share/defaults/kata-containers && \
@@ -158,8 +159,7 @@ RUN set -eu && \
     test -s "${config_dir}/configuration-qemu.toml"
 
 # Component 4: osc-guest-support
-# Combines upstream osbuilder components with OSC kata-osbuilder.sh wrapper
-# and downstream dracut config, plus kata-agent for guest initrd.
+# Combines upstream osbuilder + OSC wrapper + agent from podvm-payload.
 RUN set -eu && \
     mkdir -p /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder \
              /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin \
@@ -236,7 +236,7 @@ RUN set -eu && \
     rm -rf /verify
 
 # ---------------------------------------------------------------------------
-# Stage 4: Final artifact image
+# Stage 5: Final artifact image
 # ---------------------------------------------------------------------------
 FROM scratch
 
