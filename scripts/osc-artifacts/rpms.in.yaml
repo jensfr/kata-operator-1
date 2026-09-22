@@ -1,0 +1,36 @@
+# osc-kata-artifacts: declared RPM inputs
+#
+# Only QEMU, virtiofsd, firmware, and private libraries come from RHEL RPMs.
+# kata-containers components (shim, runtime, agent, osbuilder) are built
+# from upstream source in the kata-builder stage.
+
+platform:
+  os: rhel
+  version: "9"
+  arch: x86_64
+
+packages:
+  # QEMU and runtime
+  - qemu-kvm-core
+  - qemu-kvm-common
+  - qemu-img
+  - virtiofsd
+
+  # Firmware
+  - edk2-ovmf
+  - seabios-bin
+  - seavgabios-bin
+  - ipxe-roms-qemu
+
+  # QEMU private libraries (not on RHCOS by default)
+  - capstone
+  - daxctl-libs
+  - ndctl-libs
+  - pixman
+  - libpmem
+  - libpng
+  - libfdt
+  - librdmacm
+
+  # Build tool (tarball compression, assembler stage only)
+  - zstd

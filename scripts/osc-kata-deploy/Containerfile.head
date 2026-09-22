@@ -35,7 +35,7 @@ COPY --from=kata-deploy-source /usr/bin/kata-deploy /usr/bin/kata-deploy
 
 COPY --from=artifacts /opt/kata-artifacts /opt/kata-artifacts
 
-RUN set -e && \
+RUN set -eu && \
     test -x /usr/bin/kata-deploy && \
     test -f /opt/kata-artifacts/shim-components.json && \
     test -f /opt/kata-artifacts/versions.yaml && \
@@ -43,7 +43,9 @@ RUN set -e && \
     test -f /opt/kata-artifacts/tarballs/kata-static-qemu.tar.zst && \
     test -f /opt/kata-artifacts/tarballs/kata-static-virtiofsd.tar.zst && \
     test -f /opt/kata-artifacts/tarballs/kata-static-osc-guest-support.tar.zst && \
-    /usr/bin/kata-deploy --help 2>&1 | head -1 && \
+    /usr/bin/kata-deploy --help > /tmp/kata-deploy-help.txt 2>&1 && \
+    head -n 1 /tmp/kata-deploy-help.txt && \
+    rm /tmp/kata-deploy-help.txt && \
     echo "Image contract verified"
 
 ENTRYPOINT ["/usr/bin/kata-deploy"]
