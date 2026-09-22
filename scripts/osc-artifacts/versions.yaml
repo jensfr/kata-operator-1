@@ -1,9 +1,16 @@
-kata-runtime:
-  version: "3.31.0"
-  source: "konflux"
+shim-v2-go:
+  source: "kata-containers RPM"
+  note: "containerd-shim-kata-v2, kata-runtime, kata-collect-data, configuration.toml"
 qemu:
-  version: "from-rhel"
-  source: "rhel-9.4-repos"
+  source: "RHEL 9 RPMs"
+  note: "qemu-kvm-core, qemu-kvm-common, qemu-img, private libs, firmware"
 virtiofsd:
-  version: "from-rhel"
-  source: "rhel-9.4-repos"
+  source: "RHEL 9 RPMs"
+  note: "virtiofsd"
+osc-guest-support:
+  source: "kata-containers RPM + OSC"
+  note: "osbuilder, kata-agent, osc-kata-guest-prep.service"
+kata-deploy:
+  version: "4.2.0"
+  source: "upstream release"
+  note: "installer binary only; artifacts are Red Hat built"
