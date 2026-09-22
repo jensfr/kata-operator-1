@@ -55,7 +55,8 @@ which RH component owns the build.
 ```
 Component A: osc-kata-artifacts
   Inputs:
-    - kata-containers source @ pinned ref (shim, runtime, agent)
+    - kata-containers source @ pinned ref (shim, runtime, config, osbuilder, agent systemd units)
+    - osc-podvm-payload image @ digest (kata-agent binary)
     - RHEL RPMs (QEMU, virtiofsd, firmware, libs)
     - kata-osbuilder.sh + dracut config from CCA
   Output:

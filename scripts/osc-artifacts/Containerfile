@@ -1,41 +1,32 @@
 # osc-kata-artifacts: Complete Red Hat kata payload for upstream kata-deploy.
 #
-# Shim and runtime are built from pinned kata-containers source (Go).
-# kata-agent comes from the existing osc-podvm-payload Konflux build.
-# QEMU, virtiofsd, firmware, and private libraries come from RHEL RPMs.
+# Shim and runtime are built from pinned kata-containers source on UBI9 (Go).
+# Agent is built on CentOS Stream 9 (Rust 1.98, el9 RPM, RHEL 9 ABI).
+# QEMU, virtiofsd, firmware, and private libraries come from RHEL 9 RPMs.
 #
 # Produces /opt/kata-artifacts/ with four component tarballs:
-#   kata-static-shim-v2-go.tar.zst       - shim, runtime, config (Go source build)
+#   kata-static-shim-v2-go.tar.zst       - shim, runtime, config (Go)
 #   kata-static-qemu.tar.zst             - QEMU, libs, firmware (RHEL RPMs)
 #   kata-static-virtiofsd.tar.zst        - virtiofsd (RHEL RPMs)
-#   kata-static-osc-guest-support.tar.zst - osbuilder, agent, boot svc
+#   kata-static-osc-guest-support.tar.zst - agent, osbuilder, systemd units, boot svc
+#
+# The agent is built on UBI9 (RHEL 9 glibc) so it can run inside
+# host-derived initrds on RHCOS 9.x nodes.
 #
 # Build:
 #   podman build --platform linux/amd64 \
 #     --secret id=entitlement-key,src=~/.osc-build-secrets/entitlement-key.pem \
 #     --secret id=entitlement,src=~/.osc-build-secrets/entitlement.pem \
 #     --build-arg KATA_SOURCE_REF=4.2.0 \
-#     --build-arg PODVM_PAYLOAD_IMAGE=<osc-podvm-payload@digest> \
 #     -f Containerfile \
 #     -t quay.io/openshift_sandboxed_containers/osc-kata-artifacts:latest .
 
 ARG KATA_SOURCE_REF=4.2.0
 ARG GO_VERSION=1.26.7
-ARG PODVM_PAYLOAD_IMAGE
 
 # ---------------------------------------------------------------------------
-# Stage 1: Extract kata-agent from existing Konflux build
-# ---------------------------------------------------------------------------
-FROM ${PODVM_PAYLOAD_IMAGE} AS podvm-payload
-
-RUN set -eu && \
-    mkdir -p /agent-out/usr/bin && \
-    tar xf /podvm-binaries.tar.gz -C /tmp && \
-    cp /tmp/usr/local/bin/kata-agent /agent-out/usr/bin/kata-agent && \
-    test -x /agent-out/usr/bin/kata-agent
-
-# ---------------------------------------------------------------------------
-# Stage 2: Build shim and runtime from kata-containers source (Go only)
+# Stage 1: Build shim, runtime, and agent from kata-containers source
+# Shim/runtime are Go; agent is Rust. All from the same pinned ref.
 # ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi:9.6 AS kata-builder
 
@@ -62,6 +53,8 @@ RUN set -eu && cd /kata-src/src/runtime && \
     cp containerd-shim-kata-v2 /kata-out/bin/ && \
     cp kata-runtime /kata-out/bin/
 
+# Agent is built in a separate CentOS Stream 9 stage (see below).
+
 # Copy generated config and tools
 RUN set -eu && \
     mkdir -p /kata-out/config && \
@@ -73,12 +66,8 @@ RUN set -eu && \
     cp /kata-src/src/runtime/data/kata-collect-data.sh /kata-out/bin/ && \
     chmod +x /kata-out/bin/kata-collect-data.sh
 
-# Generate agent systemd units from source (no Rust needed)
-RUN set -eu && \
-    cd /kata-src/src/agent && \
-    make kata-agent.service 2>/dev/null && \
-    mkdir -p /kata-out/agent-systemd && \
-    cp kata-agent.service kata-containers.target /kata-out/agent-systemd/
+# Record source revision
+RUN git -C /kata-src rev-parse HEAD > /kata-out/kata-vcs-ref
 
 # Copy upstream osbuilder components
 RUN set -eu && \
@@ -90,6 +79,40 @@ RUN set -eu && \
     cp -r /kata-src/tools/osbuilder/scripts /kata-out/osbuilder/ && \
     cp /kata-src/tools/osbuilder/VERSION /kata-out/osbuilder/ && \
     cp /kata-src/tools/osbuilder/Makefile /kata-out/osbuilder/
+
+# ---------------------------------------------------------------------------
+# Stage 2: Build kata-agent on CentOS Stream 9 (Rust 1.98, el9 ABI)
+# Uses the same kata source ref as the shim/runtime build.
+# CentOS Stream 9 provides a sufficiently new Rust as an el9 RPM,
+# producing an agent linked against RHEL 9 glibc.
+# ---------------------------------------------------------------------------
+FROM quay.io/centos/centos:stream9 AS agent-builder
+
+ARG KATA_SOURCE_REF
+
+RUN dnf install -y git gcc make rust cargo clang-devel libseccomp-devel && dnf clean all
+
+RUN git clone --depth 1 --branch ${KATA_SOURCE_REF} \
+    https://github.com/kata-containers/kata-containers.git /kata-src
+
+RUN set -eu && \
+    rustc --version --verbose && \
+    cargo --version && \
+    cd /kata-src/src/agent && \
+    make LIBC=gnu && \
+    mkdir -p /agent-out/usr/bin && \
+    cp ../../target/x86_64-unknown-linux-gnu/release/kata-agent /agent-out/usr/bin/ && \
+    test -x /agent-out/usr/bin/kata-agent
+
+# Generate agent systemd units
+RUN set -eu && \
+    cd /kata-src/src/agent && \
+    make kata-agent.service 2>/dev/null && \
+    mkdir -p /agent-out/systemd && \
+    cp kata-agent.service kata-containers.target /agent-out/systemd/
+
+# Record source revision
+RUN git -C /kata-src rev-parse HEAD > /agent-out/kata-vcs-ref
 
 # ---------------------------------------------------------------------------
 # Stage 3: RHEL components (QEMU, virtiofsd, firmware, libraries)
@@ -142,10 +165,12 @@ RUN set -eu && \
 # ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS assembler
 
-RUN microdnf install -y zstd tar && microdnf clean all
+ARG KATA_SOURCE_REF
+
+RUN microdnf install -y zstd tar file binutils && microdnf clean all
 
 COPY --from=kata-builder /kata-out/ /kata-out/
-COPY --from=podvm-payload /agent-out/ /kata-out/agent/
+COPY --from=agent-builder /agent-out/ /agent-out/
 COPY --from=rhel-builder /c/ /c/
 
 # OSC-owned guest builder and downstream dracut config
@@ -174,12 +199,12 @@ RUN set -eu && \
     cp -r /kata-out/osbuilder/* \
        /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/ && \
     test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh && \
-    cp /kata-out/agent/usr/bin/kata-agent \
+    cp /agent-out/usr/bin/kata-agent \
        /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/ && \
     chmod +x /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
     mkdir -p /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system && \
-    cp /kata-out/agent-systemd/kata-agent.service \
-       /kata-out/agent-systemd/kata-containers.target \
+    cp /agent-out/systemd/kata-agent.service \
+       /agent-out/systemd/kata-containers.target \
        /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/
 
 RUN cat > /c/osc-guest-support/opt/kata/share/systemd/osc-kata-guest-prep.service <<'UNIT'
@@ -249,6 +274,28 @@ RUN set -eu && \
     ! grep -rq '@[A-Z].*@' opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \
     echo "Payload contract verified" && \
     rm -rf /verify
+
+# Record provenance and complete ELF diagnostics
+RUN set -eu && \
+    agent=/c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
+    out=/opt/kata-artifacts/provenance && \
+    mkdir -p "$out" && \
+    test -x "$agent" && \
+    cp /kata-out/kata-vcs-ref "$out/shim-vcs-ref" && \
+    cp /agent-out/kata-vcs-ref "$out/agent-vcs-ref" && \
+    echo "shim-source: kata-containers ${KATA_SOURCE_REF} (Go on UBI9)" > "$out/build-inputs.txt" && \
+    echo "shim-vcs-ref: $(cat /kata-out/kata-vcs-ref)" >> "$out/build-inputs.txt" && \
+    echo "agent-source: kata-containers ${KATA_SOURCE_REF} (Rust 1.98 on CentOS Stream 9, LIBC=gnu)" >> "$out/build-inputs.txt" && \
+    echo "agent-vcs-ref: $(cat /agent-out/kata-vcs-ref)" >> "$out/build-inputs.txt" && \
+    sha256sum "$agent" > "$out/agent-sha256.txt" && \
+    file "$agent" > "$out/agent-file.txt" && \
+    readelf -hW "$agent" > "$out/agent-elf-header.txt" && \
+    readelf -lW "$agent" > "$out/agent-program-headers.txt" && \
+    readelf -dW "$agent" > "$out/agent-dynamic.txt" && \
+    readelf -VW "$agent" > "$out/agent-symbol-versions.txt" && \
+    readelf --dyn-syms --wide "$agent" > "$out/agent-dynamic-symbols.txt" && \
+    echo "Provenance and ELF diagnostics recorded:" && \
+    ls -la "$out/"
 
 # ---------------------------------------------------------------------------
 # Stage 5: Final artifact image
