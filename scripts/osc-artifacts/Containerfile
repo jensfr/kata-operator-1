@@ -73,6 +73,13 @@ RUN set -eu && \
     cp /kata-src/src/runtime/data/kata-collect-data.sh /kata-out/bin/ && \
     chmod +x /kata-out/bin/kata-collect-data.sh
 
+# Generate agent systemd units from source (no Rust needed)
+RUN set -eu && \
+    cd /kata-src/src/agent && \
+    make kata-agent.service 2>/dev/null && \
+    mkdir -p /kata-out/agent-systemd && \
+    cp kata-agent.service kata-containers.target /kata-out/agent-systemd/
+
 # Copy upstream osbuilder components
 RUN set -eu && \
     mkdir -p /kata-out/osbuilder && \
@@ -169,7 +176,11 @@ RUN set -eu && \
     test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh && \
     cp /kata-out/agent/usr/bin/kata-agent \
        /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/ && \
-    chmod +x /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent
+    chmod +x /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
+    mkdir -p /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system && \
+    cp /kata-out/agent-systemd/kata-agent.service \
+       /kata-out/agent-systemd/kata-containers.target \
+       /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/
 
 RUN cat > /c/osc-guest-support/opt/kata/share/systemd/osc-kata-guest-prep.service <<'UNIT'
 [Unit]
@@ -198,6 +209,8 @@ RUN set -eu && \
     test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/rootfs-builder/rootfs.sh && \
     test -f /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/scripts/lib.sh && \
     test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
+    test -f /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/kata-agent.service && \
+    test -f /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/kata-containers.target && \
     test -s /c/shim-v2-go/opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \
     test -L /c/shim-v2-go/opt/kata/share/defaults/kata-containers/configuration.toml && \
     ! grep -q '@[A-Z].*@' /c/shim-v2-go/opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \
@@ -230,6 +243,8 @@ RUN set -eu && \
     test -x opt/kata/libexec/kata-containers/osbuilder/rootfs-builder/rootfs.sh && \
     test -f opt/kata/libexec/kata-containers/osbuilder/scripts/lib.sh && \
     test -x opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
+    test -f opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/kata-agent.service && \
+    test -f opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/kata-containers.target && \
     test -f opt/kata/share/systemd/osc-kata-guest-prep.service && \
     ! grep -rq '@[A-Z].*@' opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \
     echo "Payload contract verified" && \

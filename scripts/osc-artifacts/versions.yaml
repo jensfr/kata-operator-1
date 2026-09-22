@@ -9,9 +9,11 @@ virtiofsd:
   source: "RHEL 9 RPMs"
   components: "virtiofsd"
 osc-guest-support:
-  agent-source: "osc-podvm-payload Konflux build"
+  agent-source: "osc-podvm-payload Konflux build (openshift/cloud-api-adaptor podvm-payload)"
+  agent-note: "pin PODVM_PAYLOAD_IMAGE by digest; record kata-vcs-ref from that image"
+  agent-systemd: "kata-agent.service and kata-containers.target generated from kata source"
   osbuilder-source: "kata-containers upstream source + OSC kata-osbuilder.sh"
-  components: "kata-agent, osbuilder, dracut config, osc-kata-guest-prep.service"
+  components: "kata-agent, kata-agent.service, kata-containers.target, osbuilder, dracut config, osc-kata-guest-prep.service"
 kata-deploy:
   source: "kata-containers upstream"
   ref: "4.2.0"
