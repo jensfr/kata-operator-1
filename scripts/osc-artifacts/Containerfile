@@ -1,0 +1,307 @@
+# osc-kata-artifacts: Complete Red Hat kata payload for upstream kata-deploy.
+#
+# Shim and runtime are built from pinned kata-containers source on UBI9 (Go).
+# Agent is built on CentOS Stream 9 (Rust 1.98, el9 RPM, RHEL 9 ABI).
+# QEMU, virtiofsd, firmware, and private libraries come from RHEL 9 RPMs.
+#
+# Produces /opt/kata-artifacts/ with four component tarballs:
+#   kata-static-shim-v2-go.tar.zst       - shim, runtime, config (Go)
+#   kata-static-qemu.tar.zst             - QEMU, libs, firmware (RHEL RPMs)
+#   kata-static-virtiofsd.tar.zst        - virtiofsd (RHEL RPMs)
+#   kata-static-osc-guest-support.tar.zst - agent, osbuilder, systemd units, boot svc
+#
+# The agent is built on UBI9 (RHEL 9 glibc) so it can run inside
+# host-derived initrds on RHCOS 9.x nodes.
+#
+# Build:
+#   podman build --platform linux/amd64 \
+#     --secret id=entitlement-key,src=~/.osc-build-secrets/entitlement-key.pem \
+#     --secret id=entitlement,src=~/.osc-build-secrets/entitlement.pem \
+#     --build-arg KATA_SOURCE_REF=4.2.0 \
+#     -f Containerfile \
+#     -t quay.io/openshift_sandboxed_containers/osc-kata-artifacts:latest .
+
+ARG KATA_SOURCE_REF=4.2.0
+ARG GO_VERSION=1.26.7
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build shim, runtime, and agent from kata-containers source
+# Shim/runtime are Go; agent is Rust. All from the same pinned ref.
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi:9.6 AS kata-builder
+
+ARG KATA_SOURCE_REF
+ARG GO_VERSION
+
+RUN --mount=type=secret,id=entitlement-key,dst=/etc/pki/entitlement/entitlement-key.pem \
+    --mount=type=secret,id=entitlement,dst=/etc/pki/entitlement/entitlement.pem \
+    dnf install -y --nodocs git gcc gcc-c++ make \
+    libseccomp-devel glib2-devel && dnf clean all
+
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | \
+    tar -C /usr/local -xzf - && \
+    ln -s /usr/local/go/bin/go /usr/local/bin/go
+
+RUN git clone --depth 1 --branch ${KATA_SOURCE_REF} \
+    https://github.com/kata-containers/kata-containers.git /kata-src
+
+# Build shim and runtime (also generates configuration-qemu.toml)
+RUN set -eu && cd /kata-src/src/runtime && \
+    PREFIX=/opt/kata PREFIXDEPS=/opt/kata \
+    make containerd-shim-v2 runtime && \
+    mkdir -p /kata-out/bin && \
+    cp containerd-shim-kata-v2 /kata-out/bin/ && \
+    cp kata-runtime /kata-out/bin/
+
+# Agent is built in a separate CentOS Stream 9 stage (see below).
+
+# Copy generated config and tools
+RUN set -eu && \
+    mkdir -p /kata-out/config && \
+    cp /kata-src/src/runtime/config/configuration-qemu.toml \
+       /kata-out/config/configuration-qemu.toml && \
+    test -s /kata-out/config/configuration-qemu.toml && \
+    ! grep -q '@[A-Z].*@' /kata-out/config/configuration-qemu.toml && \
+    test -f /kata-src/src/runtime/data/kata-collect-data.sh && \
+    cp /kata-src/src/runtime/data/kata-collect-data.sh /kata-out/bin/ && \
+    chmod +x /kata-out/bin/kata-collect-data.sh
+
+# Record source revision
+RUN git -C /kata-src rev-parse HEAD > /kata-out/kata-vcs-ref
+
+# Copy upstream osbuilder components
+RUN set -eu && \
+    mkdir -p /kata-out/osbuilder && \
+    cp -r /kata-src/tools/osbuilder/dracut /kata-out/osbuilder/ && \
+    cp -r /kata-src/tools/osbuilder/initrd-builder /kata-out/osbuilder/ && \
+    cp -r /kata-src/tools/osbuilder/image-builder /kata-out/osbuilder/ && \
+    cp -r /kata-src/tools/osbuilder/rootfs-builder /kata-out/osbuilder/ && \
+    cp -r /kata-src/tools/osbuilder/scripts /kata-out/osbuilder/ && \
+    cp /kata-src/tools/osbuilder/VERSION /kata-out/osbuilder/ && \
+    cp /kata-src/tools/osbuilder/Makefile /kata-out/osbuilder/
+
+# ---------------------------------------------------------------------------
+# Stage 2: Build kata-agent on CentOS Stream 9 (Rust 1.98, el9 ABI)
+# Uses the same kata source ref as the shim/runtime build.
+# CentOS Stream 9 provides a sufficiently new Rust as an el9 RPM,
+# producing an agent linked against RHEL 9 glibc.
+# ---------------------------------------------------------------------------
+FROM quay.io/centos/centos:stream9 AS agent-builder
+
+ARG KATA_SOURCE_REF
+
+RUN dnf install -y git gcc make rust cargo clang-devel libseccomp-devel && dnf clean all
+
+RUN git clone --depth 1 --branch ${KATA_SOURCE_REF} \
+    https://github.com/kata-containers/kata-containers.git /kata-src
+
+RUN set -eu && \
+    rustc --version --verbose && \
+    cargo --version && \
+    cd /kata-src/src/agent && \
+    make LIBC=gnu && \
+    mkdir -p /agent-out/usr/bin && \
+    cp ../../target/x86_64-unknown-linux-gnu/release/kata-agent /agent-out/usr/bin/ && \
+    test -x /agent-out/usr/bin/kata-agent
+
+# Generate agent systemd units
+RUN set -eu && \
+    cd /kata-src/src/agent && \
+    make kata-agent.service 2>/dev/null && \
+    mkdir -p /agent-out/systemd && \
+    cp kata-agent.service kata-containers.target /agent-out/systemd/
+
+# Record source revision
+RUN git -C /kata-src rev-parse HEAD > /agent-out/kata-vcs-ref
+
+# ---------------------------------------------------------------------------
+# Stage 3: RHEL components (QEMU, virtiofsd, firmware, libraries)
+# ---------------------------------------------------------------------------
+FROM registry.redhat.io/ubi9/ubi:9.6 AS rhel-builder
+
+RUN --mount=type=secret,id=entitlement-key,dst=/etc/pki/entitlement/entitlement-key.pem \
+    --mount=type=secret,id=entitlement,dst=/etc/pki/entitlement/entitlement.pem \
+    dnf install -y --nodocs \
+    qemu-kvm-core qemu-kvm-common qemu-img virtiofsd \
+    edk2-ovmf seabios-bin seavgabios-bin ipxe-roms-qemu \
+    capstone daxctl-libs ndctl-libs pixman libpmem libpng libfdt librdmacm \
+    zstd && dnf clean all
+
+# Stage QEMU
+RUN set -eu && \
+    mkdir -p /c/qemu/opt/kata/{bin,lib,share/qemu-kvm,share/edk2} && \
+    QEMU=$(rpm -ql qemu-kvm-core | grep "qemu-kvm$" | head -1) && \
+    cp "$QEMU" /c/qemu/opt/kata/bin/qemu-system-x86_64.real && \
+    printf '#!/bin/sh\nset -eu\nexport LD_LIBRARY_PATH=/var/opt/kata/lib\nexec /var/opt/kata/bin/qemu-system-x86_64.real "$@"\n' \
+      > /c/qemu/opt/kata/bin/qemu-system-x86_64 && chmod +x /c/qemu/opt/kata/bin/qemu-system-x86_64 && \
+    cp /usr/bin/qemu-img /c/qemu/opt/kata/bin/qemu-img.real && \
+    printf '#!/bin/sh\nset -eu\nexport LD_LIBRARY_PATH=/var/opt/kata/lib\nexec /var/opt/kata/bin/qemu-img.real "$@"\n' \
+      > /c/qemu/opt/kata/bin/qemu-img && chmod +x /c/qemu/opt/kata/bin/qemu-img
+
+# Private libraries
+RUN set -eu && \
+    for lib in libcapstone.so.4 libdaxctl.so.1 libndctl.so.6 libpixman-1.so.0 \
+               libpmem.so.1 libpng16.so.16 libfdt.so.1 librdmacm.so.1; do \
+      src=$(ldconfig -p | grep "	$lib " | awk '{print $NF}' | head -1); \
+      [ -n "$src" ] && cp -L "$src" /c/qemu/opt/kata/lib/$lib || { echo "FATAL: $lib missing"; exit 1; }; \
+    done
+
+# Firmware
+RUN set -eu && \
+    cp /usr/share/qemu-kvm/*.bin /c/qemu/opt/kata/share/qemu-kvm/ 2>/dev/null || true && \
+    cp /usr/share/ipxe/qemu/efi-*.rom /c/qemu/opt/kata/share/qemu-kvm/ 2>/dev/null || true && \
+    cp /usr/share/seabios/bios-256k.bin /c/qemu/opt/kata/share/qemu-kvm/ && \
+    cp /usr/share/seavgabios/vgabios-*.bin /c/qemu/opt/kata/share/qemu-kvm/ && \
+    [ -d /usr/share/qemu-kvm/keymaps ] && cp -r /usr/share/qemu-kvm/keymaps /c/qemu/opt/kata/share/qemu-kvm/ && \
+    cp -r /usr/share/edk2/ovmf /c/qemu/opt/kata/share/edk2/
+
+# Stage virtiofsd
+RUN set -eu && \
+    mkdir -p /c/virtiofsd/opt/kata/libexec && \
+    cp /usr/libexec/virtiofsd /c/virtiofsd/opt/kata/libexec/
+
+# ---------------------------------------------------------------------------
+# Stage 4: Assemble tarballs
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS assembler
+
+ARG KATA_SOURCE_REF
+
+RUN microdnf install -y zstd tar file binutils && microdnf clean all
+
+COPY --from=kata-builder /kata-out/ /kata-out/
+COPY --from=agent-builder /agent-out/ /agent-out/
+COPY --from=rhel-builder /c/ /c/
+
+# OSC-owned guest builder and downstream dracut config
+COPY osc-guest-support/kata-osbuilder.sh /kata-out/osbuilder/kata-osbuilder.sh
+COPY osc-guest-support/dracut.conf.d/15-dracut.conf /kata-out/osbuilder/dracut/dracut.conf.d/15-dracut.conf
+RUN chmod +x /kata-out/osbuilder/kata-osbuilder.sh
+
+# Component 1: shim-v2-go (from Go source build)
+RUN set -eu && \
+    mkdir -p /c/shim-v2-go/opt/kata/bin \
+             /c/shim-v2-go/opt/kata/share/defaults/kata-containers && \
+    cp /kata-out/bin/containerd-shim-kata-v2 /c/shim-v2-go/opt/kata/bin/ && \
+    cp /kata-out/bin/kata-runtime /c/shim-v2-go/opt/kata/bin/ && \
+    cp /kata-out/bin/kata-collect-data.sh /c/shim-v2-go/opt/kata/bin/ && \
+    config_dir=/c/shim-v2-go/opt/kata/share/defaults/kata-containers && \
+    cp /kata-out/config/configuration-qemu.toml "${config_dir}/configuration-qemu.toml" && \
+    ln -s configuration-qemu.toml "${config_dir}/configuration.toml" && \
+    test -s "${config_dir}/configuration-qemu.toml"
+
+# Component 4: osc-guest-support
+# Combines upstream osbuilder + OSC wrapper + agent from podvm-payload.
+RUN set -eu && \
+    mkdir -p /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder \
+             /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin \
+             /c/osc-guest-support/opt/kata/share/systemd && \
+    cp -r /kata-out/osbuilder/* \
+       /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/ && \
+    test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh && \
+    cp /agent-out/usr/bin/kata-agent \
+       /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/ && \
+    chmod +x /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
+    mkdir -p /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system && \
+    cp /agent-out/systemd/kata-agent.service \
+       /agent-out/systemd/kata-containers.target \
+       /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/
+
+RUN cat > /c/osc-guest-support/opt/kata/share/systemd/osc-kata-guest-prep.service <<'UNIT'
+[Unit]
+Description=OSC: Generate Kata guest image for host kernel
+Before=kubelet.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+Environment=KATA_LIBEXEC_DIR=/var/opt/kata/libexec/kata-containers
+ExecStart=/var/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh -c -u
+
+[Install]
+WantedBy=kubelet.service
+UNIT
+
+# Verify all components before tarball creation
+RUN set -eu && \
+    test -x /c/shim-v2-go/opt/kata/bin/containerd-shim-kata-v2 && \
+    test -x /c/shim-v2-go/opt/kata/bin/kata-runtime && \
+    test -x /c/qemu/opt/kata/bin/qemu-system-x86_64.real && \
+    test -x /c/virtiofsd/opt/kata/libexec/virtiofsd && \
+    test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh && \
+    test -d /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/dracut && \
+    test -d /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/initrd-builder && \
+    test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/rootfs-builder/rootfs.sh && \
+    test -f /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder/scripts/lib.sh && \
+    test -x /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
+    test -f /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/kata-agent.service && \
+    test -f /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/kata-containers.target && \
+    test -s /c/shim-v2-go/opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \
+    test -L /c/shim-v2-go/opt/kata/share/defaults/kata-containers/configuration.toml && \
+    ! grep -q '@[A-Z].*@' /c/shim-v2-go/opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \
+    echo "All components verified"
+
+# Create tarballs
+RUN set -eu && \
+    mkdir -p /opt/kata-artifacts/tarballs && \
+    cd /c/shim-v2-go && tar cf - opt/kata | zstd -o /opt/kata-artifacts/tarballs/kata-static-shim-v2-go.tar.zst && \
+    cd /c/qemu && tar cf - opt/kata | zstd -o /opt/kata-artifacts/tarballs/kata-static-qemu.tar.zst && \
+    cd /c/virtiofsd && tar cf - opt/kata | zstd -o /opt/kata-artifacts/tarballs/kata-static-virtiofsd.tar.zst && \
+    cd /c/osc-guest-support && tar cf - opt/kata | zstd -o /opt/kata-artifacts/tarballs/kata-static-osc-guest-support.tar.zst && \
+    ls -lh /opt/kata-artifacts/tarballs/
+
+# Payload contract: unpack and verify critical files
+RUN set -eu && \
+    mkdir /verify && cd /verify && \
+    for t in /opt/kata-artifacts/tarballs/kata-static-*.tar.zst; do \
+      zstd -d "$t" --stdout | tar xf -; \
+    done && \
+    test -x opt/kata/bin/containerd-shim-kata-v2 && \
+    test -x opt/kata/bin/kata-runtime && \
+    test -s opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \
+    test -L opt/kata/share/defaults/kata-containers/configuration.toml && \
+    test -x opt/kata/bin/qemu-system-x86_64.real && \
+    test -x opt/kata/bin/qemu-system-x86_64 && \
+    test -f opt/kata/lib/libcapstone.so.4 && \
+    test -x opt/kata/libexec/virtiofsd && \
+    test -x opt/kata/libexec/kata-containers/osbuilder/kata-osbuilder.sh && \
+    test -x opt/kata/libexec/kata-containers/osbuilder/rootfs-builder/rootfs.sh && \
+    test -f opt/kata/libexec/kata-containers/osbuilder/scripts/lib.sh && \
+    test -x opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
+    test -f opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/kata-agent.service && \
+    test -f opt/kata/libexec/kata-containers/agent/usr/lib/systemd/system/kata-containers.target && \
+    test -f opt/kata/share/systemd/osc-kata-guest-prep.service && \
+    ! grep -rq '@[A-Z].*@' opt/kata/share/defaults/kata-containers/configuration-qemu.toml && \
+    echo "Payload contract verified" && \
+    rm -rf /verify
+
+# Record provenance and complete ELF diagnostics
+RUN set -eu && \
+    agent=/c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
+    out=/opt/kata-artifacts/provenance && \
+    mkdir -p "$out" && \
+    test -x "$agent" && \
+    cp /kata-out/kata-vcs-ref "$out/shim-vcs-ref" && \
+    cp /agent-out/kata-vcs-ref "$out/agent-vcs-ref" && \
+    echo "shim-source: kata-containers ${KATA_SOURCE_REF} (Go on UBI9)" > "$out/build-inputs.txt" && \
+    echo "shim-vcs-ref: $(cat /kata-out/kata-vcs-ref)" >> "$out/build-inputs.txt" && \
+    echo "agent-source: kata-containers ${KATA_SOURCE_REF} (Rust 1.98 on CentOS Stream 9, LIBC=gnu)" >> "$out/build-inputs.txt" && \
+    echo "agent-vcs-ref: $(cat /agent-out/kata-vcs-ref)" >> "$out/build-inputs.txt" && \
+    sha256sum "$agent" > "$out/agent-sha256.txt" && \
+    file "$agent" > "$out/agent-file.txt" && \
+    readelf -hW "$agent" > "$out/agent-elf-header.txt" && \
+    readelf -lW "$agent" > "$out/agent-program-headers.txt" && \
+    readelf -dW "$agent" > "$out/agent-dynamic.txt" && \
+    readelf -VW "$agent" > "$out/agent-symbol-versions.txt" && \
+    readelf --dyn-syms --wide "$agent" > "$out/agent-dynamic-symbols.txt" && \
+    echo "Provenance and ELF diagnostics recorded:" && \
+    ls -la "$out/"
+
+# ---------------------------------------------------------------------------
+# Stage 5: Final artifact image
+# ---------------------------------------------------------------------------
+FROM scratch
+
+COPY --from=assembler /opt/kata-artifacts/ /opt/kata-artifacts/
+COPY shim-components.json /opt/kata-artifacts/
+COPY versions.yaml /opt/kata-artifacts/

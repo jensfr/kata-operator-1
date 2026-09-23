@@ -1,0 +1,43 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kata-dispatcher
+rules:
+- apiGroups: [""]
+  resources: [nodes]
+  verbs: [list, get, patch]
+- apiGroups: ["batch"]
+  resources: [jobs]
+  verbs: [create, get, list, delete, watch]
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [list, get]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kata-dispatcher
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kata-dispatcher
+subjects:
+- kind: ServiceAccount
+  name: kata-dispatcher
+  namespace: system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kata-dispatcher-scc
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:nonroot-v2
+subjects:
+- kind: ServiceAccount
+  name: kata-dispatcher
+  namespace: system

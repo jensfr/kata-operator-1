@@ -115,6 +115,48 @@ func TestIsMachineConfigPoolAvailable(t *testing.T) {
 	})
 }
 
+func TestResolveDeploymentMode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		mode     DeploymentModeOption
+		mcoAvail bool
+		want     DeploymentMode
+		wantErr  bool
+	}{
+		{"MachineConfig + MCO yes", MachineConfigOption, true, MachineConfigMode, false},
+		{"MachineConfig + MCO no", MachineConfigOption, false, 0, true},
+		{"DaemonSet + MCO yes", DaemonSetOption, true, DaemonSetMode, false},
+		{"DaemonSet + MCO no", DaemonSetOption, false, DaemonSetMode, false},
+		{"KataDeploy + MCO yes", KataDeployOption, true, KataDeployMode, false},
+		{"KataDeploy + MCO no", KataDeployOption, false, KataDeployMode, false},
+		{"DaemonSetFallback + MCO yes", DaemonSetFallbackOption, true, MachineConfigMode, false},
+		{"DaemonSetFallback + MCO no", DaemonSetFallbackOption, false, DaemonSetMode, false},
+		{"KataDeployFallback + MCO yes", KataDeployFallbackOption, true, MachineConfigMode, false},
+		{"KataDeployFallback + MCO no", KataDeployFallbackOption, false, KataDeployMode, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := resolveDeploymentMode(tt.mode, tt.mcoAvail)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCheckConvergedClusterWhenMCPUnavailable(t *testing.T) {
 	t.Parallel()
 

@@ -80,3 +80,7 @@ testbin*
 bin/*
 # make generate files
 api/v1/zz_generated.deepcopy.go
+
+# Build artifacts and credentials (do not commit)
+scripts/osc-artifacts/build-inputs/
+scripts/osc-artifacts/build-output/

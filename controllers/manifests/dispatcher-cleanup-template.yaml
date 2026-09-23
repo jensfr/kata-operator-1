@@ -1,0 +1,144 @@
+# Node-agnostic per-node cleanup Job template for k8s-job-dispatcher.
+#
+# Pipeline:
+#   revert-cri -> OSC cleanup -> remove-artifacts
+#
+# The dispatcher removes kata-runtime label BEFORE running cleanup,
+# so nodes stop receiving kata workloads before host state is removed.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    kata-deploy/stage: cleanup
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  activeDeadlineSeconds: 3600
+  template:
+    metadata:
+      labels:
+        kata-deploy/stage: cleanup
+    spec:
+      automountServiceAccountToken: false
+      serviceAccountName: kata-install
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      # Cleanup must tolerate everything: the node may be cordoned,
+      # tainted, or NotReady during decommissioning.
+      tolerations:
+      - operator: Exists
+
+      initContainers:
+      # --- Upstream: revert CRI configuration ---
+      # OSC privilege delta: privileged for SELinux (mapping-only policy).
+      - name: revert-cri
+        image: COMBINED_IMAGE
+        command: ["/usr/bin/kata-deploy", "cleanup-stage-revert-cri"]
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: DAEMONSET_NAME
+          value: kata-install
+        - name: SHIMS_X86_64
+          value: "qemu"
+        - name: DEFAULT_SHIM_X86_64
+          value: "qemu"
+        - name: K8S_DISTRIBUTION
+          value: "k8s"
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+        - {name: crio-conf, mountPath: /etc/crio/}
+        - {name: containerd-conf, mountPath: /etc/containerd/}
+        - {name: kata-install, mountPath: /opt/kata}
+        - {name: systemd-system, mountPath: /etc/systemd/system}
+        - {name: systemd-private, mountPath: /run/systemd/private}
+        - {name: boot, mountPath: /boot, readOnly: true}
+        - {name: host-machine-id, mountPath: /host-machine-id, readOnly: true}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+        - {name: host-usr-bin, mountPath: /host-usr/bin, readOnly: true}
+        - {name: host-usr-sbin, mountPath: /host-usr/sbin, readOnly: true}
+        - {name: host-usr-local-bin, mountPath: /host-usr-local/bin, readOnly: true}
+        - {name: host-usr-local-sbin, mountPath: /host-usr-local/sbin, readOnly: true}
+        - {name: host-bin, mountPath: /host-bin, readOnly: true}
+        - {name: host-sbin, mountPath: /host-sbin, readOnly: true}
+
+      # --- OSC: remove SELinux module, boot service, guest artifacts ---
+      - name: osc-cleanup
+        image: HELPER_IMAGE
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          exec 9>/host-run-lock/kata-deploy.lock
+          flock -x 9
+          chroot /host semodule -r osc_kata_deploy 2>/dev/null || true
+          rm -f /host/etc/systemd/system/osc-kata-guest-prep.service
+          rm -f /host/etc/systemd/system/kubelet.service.wants/osc-kata-guest-prep.service
+          rm -rf /host/var/cache/kata-containers/osbuilder-images
+          echo "OSC host state cleaned"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - {name: host-root, mountPath: /host}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+
+      containers:
+      # --- Upstream: remove kata artifacts ---
+      # OSC privilege delta: privileged for SELinux (mapping-only policy).
+      - name: remove-artifacts
+        image: COMBINED_IMAGE
+        command: ["/usr/bin/kata-deploy", "cleanup-stage-remove-artifacts"]
+        env:
+        - name: NODE_NAME
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: DAEMONSET_NAME
+          value: kata-install
+        - name: SHIMS_X86_64
+          value: "qemu"
+        - name: DEFAULT_SHIM_X86_64
+          value: "qemu"
+        - name: K8S_DISTRIBUTION
+          value: "k8s"
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tmp, mountPath: /tmp}
+        - {name: crio-conf, mountPath: /etc/crio/}
+        - {name: containerd-conf, mountPath: /etc/containerd/}
+        - {name: kata-install, mountPath: /opt/kata}
+        - {name: systemd-system, mountPath: /etc/systemd/system}
+        - {name: systemd-private, mountPath: /run/systemd/private}
+        - {name: boot, mountPath: /boot, readOnly: true}
+        - {name: host-machine-id, mountPath: /host-machine-id, readOnly: true}
+        - {name: host-run-lock, mountPath: /host-run-lock}
+        - {name: host-usr-bin, mountPath: /host-usr/bin, readOnly: true}
+        - {name: host-usr-sbin, mountPath: /host-usr/sbin, readOnly: true}
+        - {name: host-usr-local-bin, mountPath: /host-usr-local/bin, readOnly: true}
+        - {name: host-usr-local-sbin, mountPath: /host-usr-local/sbin, readOnly: true}
+        - {name: host-bin, mountPath: /host-bin, readOnly: true}
+        - {name: host-sbin, mountPath: /host-sbin, readOnly: true}
+        - {name: modules-load-d, mountPath: /host-modules-load.d}
+
+      volumes:
+      - {name: tmp, emptyDir: {}}
+      - {name: host-root, hostPath: {path: /}}
+      - {name: crio-conf, hostPath: {path: /etc/crio/}}
+      - {name: containerd-conf, hostPath: {path: /etc/containerd/}}
+      - {name: kata-install, hostPath: {path: /opt/kata, type: DirectoryOrCreate}}
+      - {name: systemd-system, hostPath: {path: /etc/systemd/system, type: DirectoryOrCreate}}
+      - {name: systemd-private, hostPath: {path: /run/systemd/private, type: Socket}}
+      - {name: boot, hostPath: {path: /boot}}
+      - {name: host-machine-id, hostPath: {path: /etc/machine-id, type: File}}
+      - {name: host-run-lock, hostPath: {path: /run/lock, type: DirectoryOrCreate}}
+      - {name: host-usr-bin, hostPath: {path: /usr/bin}}
+      - {name: host-usr-sbin, hostPath: {path: /usr/sbin}}
+      - {name: host-usr-local-bin, hostPath: {path: /usr/local/bin, type: DirectoryOrCreate}}
+      - {name: host-usr-local-sbin, hostPath: {path: /usr/local/sbin, type: DirectoryOrCreate}}
+      - {name: host-bin, hostPath: {path: /bin}}
+      - {name: host-sbin, hostPath: {path: /sbin}}
+      - {name: modules-load-d, hostPath: {path: /etc/modules-load.d, type: DirectoryOrCreate}}

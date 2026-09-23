@@ -1,0 +1,21 @@
+shim-v2-go:
+  source: "kata-containers upstream source (Go build on UBI9)"
+  ref: "4.2.0"
+  components: "containerd-shim-kata-v2, kata-runtime, kata-collect-data.sh, configuration-qemu.toml"
+qemu:
+  source: "RHEL 9 RPMs"
+  components: "qemu-kvm-core, qemu-kvm-common, qemu-img, private libs, firmware"
+virtiofsd:
+  source: "RHEL 9 RPMs"
+  components: "virtiofsd"
+osc-guest-support:
+  agent-source: "kata-containers upstream source (Rust build on UBI9, LIBC=gnu)"
+  agent-note: "Built on UBI9 for RHEL 9 glibc compatibility with RHCOS 9 host-derived initrds"
+  systemd-source: "kata-containers upstream source (make kata-agent.service)"
+  osbuilder-source: "kata-containers upstream source + OSC kata-osbuilder.sh"
+  ref: "4.2.0 (same ref as shim)"
+  components: "kata-agent, kata-agent.service, kata-containers.target, osbuilder, dracut config, osc-kata-guest-prep.service"
+kata-deploy:
+  source: "kata-containers upstream"
+  ref: "4.2.0"
+  note: "installer binary only; built separately in osc-kata-deploy"

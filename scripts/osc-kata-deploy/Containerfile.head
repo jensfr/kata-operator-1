@@ -1,0 +1,51 @@
+# osc-kata-deploy: Final installer image for KataDeploy mode.
+#
+# Combines:
+#   - kata-deploy binary from upstream 4.2.0 (statically linked)
+#   - Complete Red Hat artifact payload from osc-kata-artifacts
+#
+# For development, upstream binary comes from the release image.
+# For production, Konflux builds the binary from pinned source.
+#
+# Build:
+#   podman build --platform linux/amd64 \
+#     --build-arg ARTIFACTS_IMAGE=<osc-kata-artifacts@digest> \
+#     -f Containerfile.head \
+#     -t quay.io/openshift_sandboxed_containers/osc-kata-deploy:latest .
+
+ARG KATA_DEPLOY_IMAGE=quay.io/kata-containers/kata-deploy:4.2.0
+ARG ARTIFACTS_IMAGE
+
+# ---------------------------------------------------------------------------
+# Stage 1: Upstream kata-deploy binary
+# ---------------------------------------------------------------------------
+FROM ${KATA_DEPLOY_IMAGE} AS kata-deploy-source
+
+# ---------------------------------------------------------------------------
+# Stage 2: Red Hat artifact payload
+# ---------------------------------------------------------------------------
+FROM ${ARTIFACTS_IMAGE} AS artifacts
+
+# ---------------------------------------------------------------------------
+# Stage 3: Final image
+# ---------------------------------------------------------------------------
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+
+COPY --from=kata-deploy-source /usr/bin/kata-deploy /usr/bin/kata-deploy
+
+COPY --from=artifacts /opt/kata-artifacts /opt/kata-artifacts
+
+RUN set -eu && \
+    test -x /usr/bin/kata-deploy && \
+    test -f /opt/kata-artifacts/shim-components.json && \
+    test -f /opt/kata-artifacts/versions.yaml && \
+    test -f /opt/kata-artifacts/tarballs/kata-static-shim-v2-go.tar.zst && \
+    test -f /opt/kata-artifacts/tarballs/kata-static-qemu.tar.zst && \
+    test -f /opt/kata-artifacts/tarballs/kata-static-virtiofsd.tar.zst && \
+    test -f /opt/kata-artifacts/tarballs/kata-static-osc-guest-support.tar.zst && \
+    /usr/bin/kata-deploy --help > /tmp/kata-deploy-help.txt 2>&1 && \
+    head -n 1 /tmp/kata-deploy-help.txt && \
+    rm /tmp/kata-deploy-help.txt && \
+    echo "Image contract verified"
+
+ENTRYPOINT ["/usr/bin/kata-deploy"]

@@ -1,0 +1,53 @@
+# File contexts for kata-deploy installation under /var/opt/kata.
+# Each mapping reproduces the label from the RPM-installed baseline.
+#
+# Qualifier key:  --  regular file, -d  directory, -l  symlink, (none) all types
+#
+# Mapping-only proof of concept tested on:
+# OCP 4.22 / RHCOS 9.8 / container-selinux 2.245.0, 2026-09-05.
+#
+# Seven representative artifact paths were verified using local
+# semanage fcontext mappings. A fresh kata workload ran successfully;
+# QEMU and virtiofsd were observed in container_kvm_t with per-pod
+# MCS categories.
+#
+# Packaged-module validation (without masking local overrides) and
+# expanded directory/symlink coverage: tracked in the validation
+# checklist in selinux-file-context-mappings.md.
+
+# Installation root
+/var/opt/kata		-d	system_u:object_r:usr_t:s0
+
+# Executables
+/var/opt/kata/bin	-d	system_u:object_r:bin_t:s0
+/var/opt/kata/bin(/.*)?	-d	system_u:object_r:bin_t:s0
+/var/opt/kata/bin(/.*)?	-l	system_u:object_r:bin_t:s0
+/var/opt/kata/bin(/.*)?	--	system_u:object_r:bin_t:s0
+/var/opt/kata/bin/containerd-shim-kata-v2	--	system_u:object_r:container_runtime_exec_t:s0
+/var/opt/kata/bin/qemu-system-[^/]+	--	system_u:object_r:qemu_exec_t:s0
+
+/var/opt/kata/libexec	-d	system_u:object_r:bin_t:s0
+/var/opt/kata/libexec(/.*)?	-d	system_u:object_r:bin_t:s0
+/var/opt/kata/libexec(/.*)?	-l	system_u:object_r:bin_t:s0
+/var/opt/kata/libexec(/.*)?	--	system_u:object_r:bin_t:s0
+
+# Shared libraries (Red Hat dynamically linked QEMU)
+/var/opt/kata/lib(/.*)?		system_u:object_r:lib_t:s0
+
+# Runtime configuration
+/var/opt/kata/share/defaults(/.*)?	system_u:object_r:etc_t:s0
+
+# Guest artifacts
+/var/opt/kata/share/kata-containers(/.*)?	system_u:object_r:container_ro_file_t:s0
+
+# Firmware and QEMU packaged data
+/var/opt/kata/share/kata-qemu(/.*)?	system_u:object_r:usr_t:s0
+/var/opt/kata/share/qemu-kvm(/.*)?	system_u:object_r:usr_t:s0
+/var/opt/kata/share/seabios(/.*)?	system_u:object_r:usr_t:s0
+/var/opt/kata/share/seavgabios(/.*)?	system_u:object_r:usr_t:s0
+/var/opt/kata/share/edk2(/.*)?		system_u:object_r:usr_t:s0
+
+# Other
+/var/opt/kata/share	-d	system_u:object_r:usr_t:s0
+/var/opt/kata/share/bash-completion(/.*)?	system_u:object_r:usr_t:s0
+/var/opt/kata/include(/.*)?	system_u:object_r:usr_t:s0
