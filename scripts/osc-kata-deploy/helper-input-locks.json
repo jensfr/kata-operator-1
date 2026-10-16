@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "platform": "linux/amd64",
+  "captured_from": "quay.io/jensfr/osc-helper@sha256:55ea8ffb66c5b68e09a6f97b2ad837a7825ae06344a694d980be6b084453ad37",
+  "base_images": {
+    "helper": "registry.access.redhat.com/ubi9/ubi-minimal@sha256:d1bad2a2790eac1651e57e78159a81b72ddfa7b836936b26cf51e09744bf1c2d"
+  },
+  "rpms": {
+    "helper": {
+      "file": "locks/helper.rpms",
+      "packages": 118,
+      "sha256": "5ced36ab4e24e8427b6cd1c98ba6218c849338c7deb9f58c4000098d1cc985a8"
+    }
+  }
+}

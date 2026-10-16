@@ -1,7 +1,7 @@
 # osc-kata-artifacts: Complete Red Hat kata payload for upstream kata-deploy.
 #
 # Shim and runtime are built from pinned kata-containers source on UBI9 (Go).
-# Agent is built on CentOS Stream 9 (Rust 1.98, el9 RPM, RHEL 9 ABI).
+# Agent and installer are built on CentOS Stream 9 (el9 Rust RPM, RHEL 9 ABI).
 # QEMU, virtiofsd, firmware, and private libraries come from RHEL 9 RPMs.
 #
 # Produces /opt/kata-artifacts/ with four component tarballs:
@@ -10,11 +10,12 @@
 #   kata-static-virtiofsd.tar.zst        - virtiofsd (RHEL RPMs)
 #   kata-static-osc-guest-support.tar.zst - agent, osbuilder, systemd units, boot svc
 #
-# The agent is built on UBI9 (RHEL 9 glibc) so it can run inside
-# host-derived initrds on RHCOS 9.x nodes.
+# The default target includes the installer. Use --target artifacts to export
+# only the payload for a development build with Containerfile.head.
 #
 # Build:
 #   podman build --platform linux/amd64 \
+#     --target artifacts \
 #     --secret id=entitlement-key,src=~/.osc-build-secrets/entitlement-key.pem \
 #     --secret id=entitlement,src=~/.osc-build-secrets/entitlement.pem \
 #     --build-arg KATA_SOURCE_REF=4.2.0 \
@@ -23,32 +24,56 @@
 
 ARG KATA_SOURCE_REF=4.2.0
 ARG GO_VERSION=1.26.7
+ARG GO_SHA256=ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca
+
+# Use an image input for read-only RPM mounts in build containers.
+FROM scratch AS rpm-cache
+COPY rpm-cache/ /rpms/
 
 # ---------------------------------------------------------------------------
-# Stage 1: Build shim, runtime, and agent from kata-containers source
-# Shim/runtime are Go; agent is Rust. All from the same pinned ref.
+# Stage 1: Build shim and runtime from pinned kata-containers source
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi:9.6 AS kata-builder
+FROM registry.access.redhat.com/ubi9/ubi@sha256:f3b9841ea7615b38fd271cf18ae235d8228d3369036eb175ded171c936808255 AS kata-builder
 
 ARG KATA_SOURCE_REF
+ARG KATA_SOURCE_COMMIT=c7351e797efff8bfc6bd73da0eb1909be12e2cfe
 ARG GO_VERSION
+ARG GO_SHA256
+ARG OSC_RPM_REPOS_REQUIRED=0
+ARG OSC_RPM_REPOS_SHA256
+ARG OSC_RPM_CACHE_SHA256
 
+COPY locks/install-rpms.sh locks/kata-builder.rpms /usr/share/osc-build-inputs/
 RUN --mount=type=secret,id=entitlement-key,dst=/etc/pki/entitlement/entitlement-key.pem \
     --mount=type=secret,id=entitlement,dst=/etc/pki/entitlement/entitlement.pem \
-    dnf install -y --nodocs git gcc gcc-c++ make \
-    libseccomp-devel glib2-devel && dnf clean all
+    --mount=type=secret,id=rpm-repositories,dst=/run/osc-rpm-repos/osc.repo \
+    --mount=type=secret,id=rpm-ca,dst=/run/osc-rpm-repos/ca.pem \
+    --mount=type=bind,from=rpm-cache,source=/rpms,target=/run/osc-rpm-cache,ro \
+    /bin/sh /usr/share/osc-build-inputs/install-rpms.sh /usr/share/osc-build-inputs/kata-builder.rpms dnf
 
-RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | \
-    tar -C /usr/local -xzf - && \
+COPY input-locks.json locks/verify-source.py /usr/share/osc-build-inputs/
+RUN python3 /usr/share/osc-build-inputs/verify-source.py /usr/share/osc-build-inputs/input-locks.json \
+    --ref "$KATA_SOURCE_REF" --commit "$KATA_SOURCE_COMMIT" --go-version "$GO_VERSION" --go-sha256 "$GO_SHA256"
+
+RUN curl -fsSL -o /go-sdk.tar.gz https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz && \
+    echo "${GO_SHA256}  /go-sdk.tar.gz" | sha256sum -c - && \
+    tar -C /usr/local -xzf /go-sdk.tar.gz && rm /go-sdk.tar.gz && \
     ln -s /usr/local/go/bin/go /usr/local/bin/go
 
 RUN git clone --depth 1 --branch ${KATA_SOURCE_REF} \
-    https://github.com/kata-containers/kata-containers.git /kata-src
+    https://github.com/kata-containers/kata-containers.git /kata-src && \
+    test "$(git -C /kata-src rev-parse HEAD)" = "$KATA_SOURCE_COMMIT"
+
+# Keep Go and module inputs fixed.
+ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly
+COPY locks/kata-source.sha256 /usr/share/osc-build-inputs/
+RUN cd /kata-src && sha256sum -c /usr/share/osc-build-inputs/kata-source.sha256
 
 # Build shim and runtime (also generates configuration-qemu.toml)
 RUN set -eu && cd /kata-src/src/runtime && \
     PREFIX=/opt/kata PREFIXDEPS=/opt/kata \
     make containerd-shim-v2 runtime && \
+    git diff --exit-code -- go.mod go.sum && \
     mkdir -p /kata-out/bin && \
     cp containerd-shim-kata-v2 /kata-out/bin/ && \
     cp kata-runtime /kata-out/bin/
@@ -69,6 +94,8 @@ RUN set -eu && \
 # Record source revision
 RUN git -C /kata-src rev-parse HEAD > /kata-out/kata-vcs-ref
 
+RUN test "$(cat /kata-out/kata-vcs-ref)" = "$KATA_SOURCE_COMMIT"
+
 # Copy upstream osbuilder components
 RUN set -eu && \
     mkdir -p /kata-out/osbuilder && \
@@ -86,20 +113,34 @@ RUN set -eu && \
 # CentOS Stream 9 provides a sufficiently new Rust as an el9 RPM,
 # producing an agent linked against RHEL 9 glibc.
 # ---------------------------------------------------------------------------
-FROM quay.io/centos/centos:stream9 AS agent-builder
+FROM quay.io/centos/centos@sha256:3ae91a9e172b0c973cdf145a13320171ea3266f4393b232df4b7c5fe0c34bd21 AS agent-builder
 
 ARG KATA_SOURCE_REF
+ARG KATA_SOURCE_COMMIT=c7351e797efff8bfc6bd73da0eb1909be12e2cfe
 
-RUN dnf install -y git gcc make rust cargo clang-devel libseccomp-devel && dnf clean all
+COPY locks/install-rpms.sh locks/agent-builder.rpms /usr/share/osc-build-inputs/
+RUN /bin/sh /usr/share/osc-build-inputs/install-rpms.sh /usr/share/osc-build-inputs/agent-builder.rpms dnf
+
+COPY input-locks.json locks/verify-source.py /usr/share/osc-build-inputs/
+RUN python3 /usr/share/osc-build-inputs/verify-source.py /usr/share/osc-build-inputs/input-locks.json \
+    --ref "$KATA_SOURCE_REF" --commit "$KATA_SOURCE_COMMIT"
 
 RUN git clone --depth 1 --branch ${KATA_SOURCE_REF} \
-    https://github.com/kata-containers/kata-containers.git /kata-src
+    https://github.com/kata-containers/kata-containers.git /kata-src && \
+    test "$(git -C /kata-src rev-parse HEAD)" = "$KATA_SOURCE_COMMIT"
+
+COPY locks/kata-source.sha256 /usr/share/osc-build-inputs/
+RUN cd /kata-src && sha256sum -c /usr/share/osc-build-inputs/kata-source.sha256 && \
+    cargo fetch --locked --target x86_64-unknown-linux-gnu
+
+ENV CARGO_NET_OFFLINE=true
 
 RUN set -eu && \
     rustc --version --verbose && \
     cargo --version && \
     cd /kata-src/src/agent && \
     make LIBC=gnu && \
+    git -C /kata-src diff --exit-code -- Cargo.lock && \
     mkdir -p /agent-out/usr/bin && \
     cp ../../target/x86_64-unknown-linux-gnu/release/kata-agent /agent-out/usr/bin/ && \
     test -x /agent-out/usr/bin/kata-agent
@@ -114,18 +155,23 @@ RUN set -eu && \
 # Record source revision
 RUN git -C /kata-src rev-parse HEAD > /agent-out/kata-vcs-ref
 
+RUN test "$(cat /agent-out/kata-vcs-ref)" = "$KATA_SOURCE_COMMIT"
+
 # ---------------------------------------------------------------------------
 # Stage 3: RHEL components (QEMU, virtiofsd, firmware, libraries)
 # ---------------------------------------------------------------------------
-FROM registry.redhat.io/ubi9/ubi:9.6 AS rhel-builder
+FROM registry.access.redhat.com/ubi9/ubi@sha256:f3b9841ea7615b38fd271cf18ae235d8228d3369036eb175ded171c936808255 AS rhel-builder
 
+ARG OSC_RPM_REPOS_REQUIRED=0
+ARG OSC_RPM_REPOS_SHA256
+ARG OSC_RPM_CACHE_SHA256
+COPY locks/install-rpms.sh locks/rhel-builder.rpms /usr/share/osc-build-inputs/
 RUN --mount=type=secret,id=entitlement-key,dst=/etc/pki/entitlement/entitlement-key.pem \
     --mount=type=secret,id=entitlement,dst=/etc/pki/entitlement/entitlement.pem \
-    dnf install -y --nodocs \
-    qemu-kvm-core qemu-kvm-common qemu-img virtiofsd \
-    edk2-ovmf seabios-bin seavgabios-bin ipxe-roms-qemu \
-    capstone daxctl-libs ndctl-libs pixman libpmem libpng libfdt librdmacm \
-    zstd && dnf clean all
+    --mount=type=secret,id=rpm-repositories,dst=/run/osc-rpm-repos/osc.repo \
+    --mount=type=secret,id=rpm-ca,dst=/run/osc-rpm-repos/ca.pem \
+    --mount=type=bind,from=rpm-cache,source=/rpms,target=/run/osc-rpm-cache,ro \
+    /bin/sh /usr/share/osc-build-inputs/install-rpms.sh /usr/share/osc-build-inputs/rhel-builder.rpms dnf
 
 # Stage QEMU
 RUN set -eu && \
@@ -163,11 +209,19 @@ RUN set -eu && \
 # ---------------------------------------------------------------------------
 # Stage 4: Assemble tarballs
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS assembler
+FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:c2fcb1793e00a434470271be7f46eadc2462b39f8370e6a81c861c72fb8d38db AS assembler
 
 ARG KATA_SOURCE_REF
+ARG KATA_SOURCE_COMMIT=c7351e797efff8bfc6bd73da0eb1909be12e2cfe
+ARG OSC_RPM_REPOS_REQUIRED=0
+ARG OSC_RPM_REPOS_SHA256
+ARG OSC_RPM_CACHE_SHA256
 
-RUN microdnf install -y zstd tar file binutils && microdnf clean all
+COPY locks/install-rpms.sh locks/assembler.rpms /usr/share/osc-build-inputs/
+RUN --mount=type=secret,id=rpm-repositories,dst=/run/osc-rpm-repos/osc.repo \
+    --mount=type=secret,id=rpm-ca,dst=/run/osc-rpm-repos/ca.pem \
+    --mount=type=bind,from=rpm-cache,source=/rpms,target=/run/osc-rpm-cache,ro \
+    /bin/sh /usr/share/osc-build-inputs/install-rpms.sh /usr/share/osc-build-inputs/assembler.rpms microdnf
 
 COPY --from=kata-builder /kata-out/ /kata-out/
 COPY --from=agent-builder /agent-out/ /agent-out/
@@ -191,7 +245,7 @@ RUN set -eu && \
     test -s "${config_dir}/configuration-qemu.toml"
 
 # Component 4: osc-guest-support
-# Combines upstream osbuilder + OSC wrapper + agent from podvm-payload.
+# Combines upstream osbuilder and agent with the OSC wrapper.
 RUN set -eu && \
     mkdir -p /c/osc-guest-support/opt/kata/libexec/kata-containers/osbuilder \
              /c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin \
@@ -275,6 +329,11 @@ RUN set -eu && \
     echo "Payload contract verified" && \
     rm -rf /verify
 
+# Preserve the complete locked build inputs with the payload provenance.
+COPY input-locks.json /opt/kata-artifacts/provenance/input-locks.json
+COPY locks/*.rpms locks/kata-source.sha256 /opt/kata-artifacts/provenance/locks/
+RUN sha256sum /opt/kata-artifacts/provenance/locks/* > /opt/kata-artifacts/provenance/input-locks-sha256.txt
+
 # Record provenance and complete ELF diagnostics
 RUN set -eu && \
     agent=/c/osc-guest-support/opt/kata/libexec/kata-containers/agent/usr/bin/kata-agent && \
@@ -300,8 +359,40 @@ RUN set -eu && \
 # ---------------------------------------------------------------------------
 # Stage 5: Final artifact image
 # ---------------------------------------------------------------------------
-FROM scratch
+FROM scratch AS artifacts
 
 COPY --from=assembler /opt/kata-artifacts/ /opt/kata-artifacts/
 COPY shim-components.json /opt/kata-artifacts/
 COPY versions.yaml /opt/kata-artifacts/
+
+# Build the unchanged upstream installer from the same verified source as the agent.
+FROM agent-builder AS kata-deploy-builder
+
+RUN cd /kata-src && \
+    cargo build --frozen --release --package kata-deploy && \
+    install -D target/release/kata-deploy /installer-out/usr/bin/kata-deploy && \
+    git rev-parse HEAD > /installer-out/kata-deploy-vcs-ref
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:d1bad2a2790eac1651e57e78159a81b72ddfa7b836936b26cf51e09744bf1c2d AS installer
+
+COPY --from=artifacts /opt/kata-artifacts/ /opt/kata-artifacts/
+COPY --from=kata-deploy-builder /installer-out/usr/bin/kata-deploy /usr/bin/kata-deploy
+COPY --from=kata-deploy-builder /installer-out/kata-deploy-vcs-ref /opt/kata-artifacts/provenance/kata-deploy-vcs-ref
+
+# Running the el9 binary on UBI also checks its loader and shared library ABI.
+RUN test -s /opt/kata-artifacts/tarballs/kata-static-shim-v2-go.tar.zst && \
+    test -s /opt/kata-artifacts/tarballs/kata-static-qemu.tar.zst && \
+    test -s /opt/kata-artifacts/tarballs/kata-static-virtiofsd.tar.zst && \
+    test -s /opt/kata-artifacts/tarballs/kata-static-osc-guest-support.tar.zst && \
+    test "$(cat /opt/kata-artifacts/provenance/agent-vcs-ref)" = "$(cat /opt/kata-artifacts/provenance/kata-deploy-vcs-ref)" && \
+    /usr/bin/kata-deploy --help >/dev/null
+
+ARG VERSION
+LABEL name="openshift-sandboxed-containers/osc-kata-deploy" \
+      com.redhat.component="osc-kata-deploy-container" \
+      version="$VERSION" \
+      summary="Kata installer and OSC runtime payload" \
+      description="Installs Kata runtime artifacts and host integration on OpenShift nodes" \
+      maintainer="redhat@redhat.com"
+
+ENTRYPOINT ["/usr/bin/kata-deploy"]

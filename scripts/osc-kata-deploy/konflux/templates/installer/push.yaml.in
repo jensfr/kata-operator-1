@@ -1,0 +1,46 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  annotations:
+    build.appstudio.openshift.io/repo: @GIT_URL@?rev={{revision}}
+    build.appstudio.redhat.com/commit_sha: '{{revision}}'
+    build.appstudio.redhat.com/target_branch: '{{target_branch}}'
+    pipelinesascode.tekton.dev/cancel-in-progress: "false"
+    pipelinesascode.tekton.dev/max-keep-runs: "3"
+    pipelinesascode.tekton.dev/on-cel-expression: event == "push" && target_branch
+      == "@BRANCH@" && ( "scripts/osc-artifacts/***".pathChanged() || ".tekton/@COMPONENT@-*.yaml".pathChanged()
+      || ".tekton/kata-deploy-build.yaml".pathChanged() )
+  labels:
+    appstudio.openshift.io/application: @APPLICATION@
+    appstudio.openshift.io/component: @COMPONENT@
+    pipelines.appstudio.openshift.io/type: build
+  name: @COMPONENT@-on-push
+  namespace: @TENANT@
+spec:
+  params:
+  - name: git-url
+    value: '{{source_url}}'
+  - name: revision
+    value: '{{revision}}'
+  - name: output-image
+    value: @IMAGE_PREFIX@/osc-kata-deploy:{{revision}}
+  - name: build-platforms
+    value:
+    - linux/x86_64
+  - name: dockerfile
+    value: Containerfile
+  - name: path-context
+    value: scripts/osc-artifacts
+  - name: hermetic
+    value: "false"
+  - name: sast-target-dirs
+    value: scripts/osc-artifacts
+  pipelineRef:
+    name: kata-deploy-build
+  taskRunTemplate:
+    serviceAccountName: build-pipeline-@COMPONENT@
+  workspaces:
+  - name: git-auth
+    secret:
+      secretName: '{{ git_auth_secret }}'
+status: {}

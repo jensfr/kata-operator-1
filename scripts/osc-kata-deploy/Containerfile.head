@@ -5,7 +5,8 @@
 #   - Complete Red Hat artifact payload from osc-kata-artifacts
 #
 # For development, upstream binary comes from the release image.
-# For production, Konflux builds the binary from pinned source.
+# The fork Konflux templates select ../osc-artifacts/Containerfile to build
+# the binary and payload together from verified source.
 #
 # Build:
 #   podman build --platform linux/amd64 \
