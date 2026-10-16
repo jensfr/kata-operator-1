@@ -46,12 +46,12 @@ Three dispatcher variants handle the fleet lifecycle:
 
 Two images are used:
 
-- **Combined image**: Upstream kata-deploy 4.2.0 binary with Red Hat artifact tarballs. Used for stages that invoke the kata-deploy binary. Currently uses upstream non-QEMU artifacts; production will use Konflux-built artifacts for all components.
+- **Combined image**: Upstream kata-deploy 4.2.0 binary with the OSC artifact payload. Shim, runtime, agent, and osbuilder come from Kata source; QEMU, virtiofsd, firmware, and private libraries come from RHEL RPMs. Used for stages that invoke the kata-deploy binary.
 - **Helper image**: Shell-capable UBI9 image for OSC host-integration stages that run shell scripts via `chroot /host` (selinux-install, guest-prep, restorecon-verify).
 
 ### MCP independence
 
-KataDeploy does not create, select, mutate, or depend on MachineConfigPools. Node selection is purely Kubernetes label-based via `KataConfig.spec.kataConfigPoolSelector`. Customer-owned MCPs (e.g. `gpu-worker`, `worker-dpu`) remain untouched. MCO continues to manage the node's OS lifecycle independently.
+KataDeploy does not create or modify MachineConfigPools. Its dispatchers select nodes with the worker role plus `KataConfig.spec.kataConfigPoolSelector`. Customer-owned MCPs (e.g. `gpu-worker`, `worker-dpu`) remain untouched. MCO continues to manage the node's OS lifecycle independently.
 
 ### Upstream dispatcher contract
 
@@ -69,13 +69,13 @@ OSC uses the upstream default instance (`kata-deploy.katacontainers.io/default`)
 
 ### How artifacts reach the host
 
-The combined image contains a tarball (`kata-static-qemu.tar.zst`) assembled at build time from Red Hat RPMs:
+The combined image contains four tarballs assembled from Kata source and RHEL RPMs. Their payload includes:
 
 - QEMU 10.1.0 (dynamically linked, exec wrapper for library resolution)
 - 8 private shared libraries from RHEL RPMs
 - Complete Red Hat firmware (edk2-ovmf, seabios, seavgabios, ipxe-roms, qemu-kvm data files)
 - virtiofsd
-- osbuilder scripts and kata-agent (from kata-containers RPM)
+- osbuilder scripts and kata-agent (built from Kata 4.2.0 source)
 - Boot-time systemd unit (osc-kata-guest-prep.service)
 
 The upstream `install-stage-artifacts` command extracts this tarball to `/opt/kata/` on the host, which is `/var/opt/kata/` on RHCOS (writable, persists across reboots and OS upgrades).
@@ -102,7 +102,7 @@ A mapping-only SELinux policy module assigns existing types to relocated paths u
 | `share/kata-containers/` | `container_ro_file_t` | `/var/cache/kata-containers` |
 | Firmware paths | `usr_t` | `/usr/share/edk2`, `/usr/share/seabios` |
 
-The module is pre-compiled as a `.pp` and installed via `semodule -i` in the selinux-install init container. Labels are applied with `restorecon -F -R` after artifact extraction. OSC stages that write to the host are privileged (mapping-only SELinux, no custom allow rules).
+The mapping module is pre-compiled as a `.pp` and installed via `semodule -i` in the selinux-install init container. Labels are applied with `restorecon -F -R` after artifact extraction. The same stage installs the separate `osc_monitor` CIL policy with the host's udica base and network templates. That policy grants the monitor access to runtime sockets. OSC stages that write to the host are privileged.
 
 ### Guest kernel and initrd
 
@@ -116,10 +116,10 @@ Upstream kata-deploy's `install-stage-cri` command writes a CRI-O drop-in config
 
 ### Controller reconciliation
 
-The controller uses a fleet-level generation model. It does not track per-node state or inspect partial host state.
+The controller uses a fleet-level generation model. It derives per-node status from dispatcher results, Node readiness, and runtime handlers. It does not inspect the host filesystem directly.
 
-- `dispatcherDesiredGeneration`: hash of combined image, helper image, install template, cleanup template, SELinux policy, node selector, runtime handler, dispatcher image, and common dispatcher flags.
-- `observedGeneration`: KataConfig annotation recorded after the full-rollout dispatcher Job completes.
+- `dispatcherDesiredGeneration`: hash of the KataConfig spec generation, combined image, helper image, install template, cleanup template, SELinux policy, node selector, runtime handler, dispatcher image, and common dispatcher flags. Restoring an earlier selector creates a fresh rollout instead of reusing a completed Job. Adding a node leaves this hash unchanged.
+- `observedGeneration`: KataConfig annotation recorded after the full-rollout dispatcher Job completes. The controller patches metadata with an optimistic lock, preserving the spec and its generation.
 - Generation change triggers a new full-rollout dispatcher.
 
 Fleet operation serialization: `hasActiveFleetOperation()` checks for any non-terminal dispatcher Job (rollout, coverage, or cleanup). Cleanup waits for any active rollout or coverage to finish before starting.
@@ -132,7 +132,7 @@ RuntimeClass `kata` with handler `kata-qemu`. Scheduling uses `katacontainers.io
 
 ### Deployment modes
 
-- **KataDeploy** (experimental, feature-gated): Job-based installation using kata-deploy and k8s-job-dispatcher. Designed to support both standalone OCP and HCP; HCP validation is pending.
+- **KataDeploy** (experimental, feature-gated): Job-based installation using kata-deploy and k8s-job-dispatcher. Deployment and cleanup were tested on standalone OCP and ROSA HCP. HCP VM execution still needs workers with KVM. See [October validation](kata-deploy-validation-2026-10.md).
 - **MachineConfig** (default): Existing MCO-based flow. Kept for existing customers on standalone OCP.
 - Legacy DaemonSet mode (rpm-ostree/apply-live) is kept but deprecated.
 
@@ -152,7 +152,7 @@ RuntimeClass `kata` with handler `kata-qemu`. Scheduling uses `katacontainers.io
 
 The entire `apply-live` path goes away. No rpm-ostree calls. No `/etc` tar extraction. No scriptlet parsing. No asymmetric uninstall. No staged-vs-live-vs-booted state tracking.
 
-We stop killing our own pod during installation. CRI-O restart happens in the final Job stage, after all other stages complete. The Job pod is not managed by the CRI-O instance it restarts.
+CRI-O restart happens in the final Job stage, after host preparation completes. The Job runs on the target node and uses that node's CRI-O. Recovery relies on Job retries and idempotent install stages.
 
 We release on our own schedule. A kata fix ships when it is ready, not when the next OCP z-stream opens.
 
@@ -162,7 +162,25 @@ Customer-owned MCPs are preserved. A node in a `gpu-worker` or `worker-dpu` MCP 
 
 We work upstream first. The kata-deploy binary is unchanged. Downstream builds replace artifacts, not code. The k8s-job-dispatcher is an upstream component; OSC replaces only the trigger (event-driven coverage instead of CronJob) and adds the OpenShift integration stages.
 
-## Validated (2026-09-21)
+## Current validation
+
+The [October validation record](kata-deploy-validation-2026-10.md) covers the
+source-based payload. It includes a node reboot, an OpenShift 4.22.16 to
+4.22.18 update with a new kernel and fresh Kata VM, interrupted dispatcher
+and installer recovery, and the live-workload selector-removal guard. Azure
+tests cover selector shrink and expansion, real worker addition and removal
+through Machine API, and deletion during an active rollout. The worker test
+restored the original replica count and preserved all original node UIDs.
+On October 20 the freshly built locked installer passed clean installation,
+guarded uninstall, and the full multi-node test on Azure OpenShift 4.22.19.
+The default image pins now use that tested installer digest.
+The published source installer and helper also passed an upgrade and fresh
+Kata VM test on Virtlab, with its original KataConfig and installation retained.
+Installation now rebuilds the guest initrd when the agent changes on the same
+host kernel. Validation compares the guest and payload ELF build IDs, since
+upstream strips the guest binary.
+
+## Earlier validation (2026-09-21)
 
 Validated on OCP 4.22 / RHCOS 9.8 / CRI-O 1.35.6 with kata-deploy 4.2.0 and k8s-job-dispatcher 0.3.0.
 
@@ -187,10 +205,8 @@ All workload tests passed: pod deploy/delete, filesystem, logs, sidecar, initCon
 
 ## Open items
 
-1. **Konflux build pipeline**: Build kata-deploy binary and all artifact tarballs from source in Konflux. Currently uses upstream 4.2.0 binary and upstream non-QEMU artifacts.
+1. **Konflux build pipeline**: Inactive [fork templates](../../scripts/osc-kata-deploy/konflux/README.md) prepare a source-built installer and helper. A run in the user's own tenant is still pending. Installer/helper recipes have [fixed build inputs](../../scripts/osc-artifacts/INPUT-LOCKS.md), and both passed local builds. The freshly built locked installer was published and passed the Azure lifecycle tests on October 20. Tenant repository access, retained release inputs, and release policy validation still need work. Official pipelines remain unchanged.
 
-2. **Multi-node lifecycle tests**: Selector change (3 to 2 node convergence), event-driven coverage (2 to 3), delete-while-rollout-active race proof.
+2. **HCP VM execution**: Deployment and cleanup passed on two ROSA HCP workers. A real Kata workload still needs workers with KVM.
 
-3. **HCP validation**: Same code path, pending cluster access.
-
-4. **MCO coexistence**: Test how MCO node updates/reboots interact with KataDeploy-installed artifacts (persistence, not membership).
+3. **Custom worker pools**: Reboot and OS-update persistence passed on SNO. Live membership checks with customer-owned worker MCPs remain pending.

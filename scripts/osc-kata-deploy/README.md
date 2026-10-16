@@ -25,9 +25,12 @@ error is not a default or a supported test mode.
 
 Build recipes and their fixed inputs are described in
 [the input-lock guide](../osc-artifacts/INPUT-LOCKS.md). The installer default
-remains the previously validated source image. A fresh build of the locked
-installer recipe is pending RHEL repository access; the cache-based validation
-image stays local.
+is the locked source build made on October 17 with verified signed Brew RPMs.
+It was published on October 20 and passed clean installation, guarded
+uninstall, selector changes, real worker addition/removal, and deletion during
+an active rollout on Azure OpenShift 4.22.19. All three original workers had
+KVM; their UIDs and MachineSet replica counts were preserved. See the
+[October validation record](../../docs/design/kata-deploy-validation-2026-10.md).
 
 ## Deploy
 

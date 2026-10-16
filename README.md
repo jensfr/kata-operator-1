@@ -58,6 +58,11 @@ Please refer to the [code](https://github.com/openshift/sandboxed-containers-ope
 
 ### Getting Started
 
+The experimental KataDeploy mode is documented in the
+[development guide](scripts/osc-kata-deploy/README.md). See the
+[October validation record](docs/design/kata-deploy-validation-2026-10.md)
+for tested behavior and remaining work. MachineConfig remains the default mode.
+
 Please refer to the OpenShift release specific documentation for getting started with sandboxed containers. 
 
 Further note that starting with OpenShift 4.9, the branch naming is tied to the operator version and not the OpenShift version.

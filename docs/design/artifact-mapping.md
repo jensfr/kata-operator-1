@@ -1,7 +1,7 @@
 # Artifact mapping: upstream Kata/CoCo to Red Hat builds
 
-Maps upstream artifacts to their Red Hat equivalents and identifies
-which RH component owns the build.
+Maps the current plain Kata prototype inputs and records proposed CoCo
+integration. The fork build templates do not register production components.
 
 ## Plain Kata (host-derived guest)
 
@@ -13,11 +13,11 @@ which RH component owns the build.
 | `kata-static-kernel.tar.zst` | Kata kernel build | Not shipped; host kernel used via guest-prep | N/A |
 | `kata-static-rootfs-initrd.tar.zst` | Kata rootfs/initrd build | Not shipped; generated on-node by guest-prep | N/A |
 | `kata-static-nydus.tar.zst` | Nydus snapshotter | Not shipped initially | N/A |
-| Guest builder (`kata-osbuilder.sh`) | RPM spec / CCA | OSC-specific wrapper, calls upstream osbuilder | CCA (canonical), osc-kata-artifacts (consumer) |
-| kata-agent | kata-containers `src/agent` (Rust) | From osc-podvm-payload Konflux build (gnu-linked) | osc-kata-artifacts (consumer) |
+| Guest builder (`kata-osbuilder.sh`) | RPM spec / CCA | OSC-specific wrapper, calls upstream osbuilder | OSC copy in osc-artifacts; CCA integration pending |
+| kata-agent | kata-containers `src/agent` (Rust) | Built from the same pinned Kata source on CentOS Stream 9, GNU-linked | osc-artifacts build recipe |
 | kata-agent.service, kata-containers.target | kata-containers `src/agent` | Generated from kata source (make kata-agent.service) | osc-kata-artifacts |
 | Boot service | OSC-specific | `osc-kata-guest-prep.service` | osc-kata-artifacts |
-| Dracut config | RPM spec / CCA | `15-dracut.conf` (RHCOS modules) | CCA (canonical), osc-kata-artifacts (consumer) |
+| Dracut config | RPM spec / CCA | `15-dracut.conf` (RHCOS modules) | OSC copy in osc-artifacts; CCA integration pending |
 
 ## Confidential Containers
 
@@ -42,7 +42,9 @@ which RH component owns the build.
 
 ## Key design boundaries
 
-**`kata-osbuilder.sh` canonical source is CCA**, not the kata-containers RPM or our operator repo. Our current copy in `osc-guest-support/` should reference CCA, not maintain an independent fork.
+The current build copies `kata-osbuilder.sh` and the dracut configuration
+from `scripts/osc-artifacts/osc-guest-support`. Consuming these from a CCA
+artifact image remains an integration decision.
 
 **Plain Kata uses host-derived guest**: no pre-built kernel/initrd shipped. Guest-prep runs `kata-osbuilder.sh` on the node at install time and on boot.
 
@@ -53,24 +55,21 @@ which RH component owns the build.
 ## Konflux component mapping
 
 ```
-Component A: osc-kata-artifacts
+Fork prototype: kata-prototype-installer
   Inputs:
-    - kata-containers source @ pinned ref (shim, runtime, config, osbuilder, agent systemd units)
-    - osc-podvm-payload image @ digest (kata-agent binary)
+    - Kata 4.2.0 source, verified against its commit
+      (shim, runtime, config, agent, osbuilder, systemd units, installer)
     - RHEL RPMs (QEMU, virtiofsd, firmware, libs)
-    - kata-osbuilder.sh + dracut config from CCA
+    - OSC copy of kata-osbuilder.sh and dracut configuration
   Output:
-    - 4 tarballs for plain Kata qemu/x86_64
+    - Final installer with 4 tarballs for plain Kata qemu/x86_64
+    - Intermediate "artifacts" target for separate development assembly
 
-Component B: osc-kata-deploy
-  Inputs:
-    - kata-deploy binary (from pinned kata source or upstream release)
-    - osc-kata-artifacts image @ digest
-    - (future) CCA CoCo artifacts @ digest
+Fork prototype: kata-prototype-helper
   Output:
-    - Final installer image
+    - Shell tools for OSC host integration stages
 
-CCA:
+Planned CCA integration:
   Inputs:
     - kata-containers source @ pinned ref
     - guest-components source @ pinned ref
@@ -84,6 +83,12 @@ CCA:
 
 Separately: RH k8s-job-dispatcher build
 ```
+
+The templates and renderer are in
+[`scripts/osc-kata-deploy/konflux`](../../scripts/osc-kata-deploy/konflux/README.md).
+The current prototype is a connected build on the user's fork. Production
+pipeline changes, component registration, and bundle image references remain
+separate work.
 
 ## Open decisions
 

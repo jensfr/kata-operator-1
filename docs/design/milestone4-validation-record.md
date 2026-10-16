@@ -1,5 +1,9 @@
 # Milestone 4 validation record
 
+This is the September record for earlier images. See
+[October validation](kata-deploy-validation-2026-10.md) for the current payload,
+status and uninstall fixes, and HCP results.
+
 ## Result: PASSED
 
 **Dates:** 2026-09-07 (simulated controller), 2026-09-08 (operator-driven E2E)
