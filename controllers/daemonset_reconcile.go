@@ -58,38 +58,55 @@ const (
 	UninstallKata KataDaemonSetAction = "uninstall"
 )
 
-// ensureKataInstallSCC creates or updates the SecurityContextConstraints
-// needed for the kata-install DaemonSet. SA and RBAC are bundled statically.
-func (r *KataConfigOpenShiftReconciler) ensureKataInstallSCC() error {
-	ctx := context.TODO()
-
-	scc := &securityv1.SecurityContextConstraints{
+func desiredKataInstallSCC() *securityv1.SecurityContextConstraints {
+	return &securityv1.SecurityContextConstraints{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "kata-install-scc",
 		},
-	}
-	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, scc, func() error {
-		scc.AllowPrivilegedContainer = true
-		scc.AllowHostDirVolumePlugin = true
-		scc.AllowHostPID = true
-		scc.AllowHostNetwork = false
-		scc.AllowHostPorts = false
-		scc.AllowHostIPC = false
-		scc.ReadOnlyRootFilesystem = false
-		scc.RunAsUser = securityv1.RunAsUserStrategyOptions{
+		AllowPrivilegedContainer: true,
+		AllowHostDirVolumePlugin: true,
+		AllowHostPID:             true,
+		AllowHostNetwork:         false,
+		AllowHostPorts:           false,
+		AllowHostIPC:             false,
+		ReadOnlyRootFilesystem:   false,
+		RunAsUser: securityv1.RunAsUserStrategyOptions{
 			Type: securityv1.RunAsUserStrategyRunAsAny,
-		}
-		scc.SELinuxContext = securityv1.SELinuxContextStrategyOptions{
+		},
+		SELinuxContext: securityv1.SELinuxContextStrategyOptions{
 			Type: securityv1.SELinuxStrategyRunAsAny,
-		}
-		scc.Users = []string{
+		},
+		Users: []string{
 			fmt.Sprintf("system:serviceaccount:%s:kata-install", OperatorNamespace),
-		}
-		scc.Volumes = []securityv1.FSType{
+		},
+		Volumes: []securityv1.FSType{
 			securityv1.FSTypeHostPath,
 			securityv1.FSTypeSecret,
 			securityv1.FSTypeConfigMap,
-		}
+			securityv1.FSTypeEmptyDir,
+		},
+	}
+}
+
+func (r *KataConfigOpenShiftReconciler) ensureKataInstallSCC() error {
+	ctx := context.TODO()
+	desired := desiredKataInstallSCC()
+
+	scc := &securityv1.SecurityContextConstraints{
+		ObjectMeta: metav1.ObjectMeta{Name: desired.Name},
+	}
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, scc, func() error {
+		scc.AllowPrivilegedContainer = desired.AllowPrivilegedContainer
+		scc.AllowHostDirVolumePlugin = desired.AllowHostDirVolumePlugin
+		scc.AllowHostPID = desired.AllowHostPID
+		scc.AllowHostNetwork = desired.AllowHostNetwork
+		scc.AllowHostPorts = desired.AllowHostPorts
+		scc.AllowHostIPC = desired.AllowHostIPC
+		scc.ReadOnlyRootFilesystem = desired.ReadOnlyRootFilesystem
+		scc.RunAsUser = desired.RunAsUser
+		scc.SELinuxContext = desired.SELinuxContext
+		scc.Users = desired.Users
+		scc.Volumes = desired.Volumes
 		return nil
 	}); err != nil {
 		return fmt.Errorf("failed to create or update SecurityContextConstraints: %w", err)

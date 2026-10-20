@@ -1,0 +1,7 @@
+module osc_kata_deploy 1.0;
+
+require {
+    class file { getattr };
+    class dir { getattr };
+    type bin_t;
+}

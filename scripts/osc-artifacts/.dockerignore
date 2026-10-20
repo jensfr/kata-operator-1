@@ -1,0 +1,11 @@
+**
+!Containerfile
+!shim-components.json
+!versions.yaml
+!input-locks.json
+!locks/
+!locks/**
+!rpm-cache/
+!rpm-cache/**
+!osc-guest-support/
+!osc-guest-support/**

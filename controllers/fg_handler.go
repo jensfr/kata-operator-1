@@ -128,8 +128,9 @@ func (r *KataConfigOpenShiftReconciler) processFeatureGates() error {
 		return err
 	}
 
-	if r.DeploymentMode == DaemonSetMode {
+	if r.DeploymentMode != MachineConfigMode {
 		r.Log.Info("Skipping layered image deployment feature, not using MCO")
+		r.ImgMc = nil
 		return nil
 	}
 

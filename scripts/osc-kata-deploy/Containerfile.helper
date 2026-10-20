@@ -1,0 +1,19 @@
+# OSC host-integration helper image.
+# Shell-capable UBI9 image for init containers that run shell scripts
+# via chroot on the host: selinux-install, guest-prep, apply-labels.
+#
+# Build: ./scripts/osc-kata-deploy/build-helper.sh -t localhost/osc-helper:source
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:d1bad2a2790eac1651e57e78159a81b72ddfa7b836936b26cf51e09744bf1c2d AS helper
+
+COPY locks/install-rpms.sh locks/helper.rpms /usr/share/osc-build-inputs/
+COPY helper-input-locks.json /usr/share/osc-build-inputs/input-locks.json
+RUN /bin/sh /usr/share/osc-build-inputs/install-rpms.sh /usr/share/osc-build-inputs/helper.rpms microdnf
+
+ARG VERSION
+LABEL name="openshift-sandboxed-containers/osc-helper" \
+      com.redhat.component="osc-helper-container" \
+      version="$VERSION" \
+      summary="Tools for OSC host integration stages" \
+      description="Runs OSC SELinux and guest image preparation stages" \
+      maintainer="redhat@redhat.com"

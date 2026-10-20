@@ -1,0 +1,13 @@
+(block osc_monitor
+    (blockinherit container)
+    (blockinherit net_container)
+    (allow process process ( capability ( chown dac_override setfcap setgid setpcap setuid )))
+
+    (allow process container_runtime_t (unix_stream_socket (connectto)))
+
+    (allow process container_var_run_t ( dir ( add_name create getattr ioctl lock open read remove_name rmdir search setattr watch write )))
+    (allow process container_var_run_t ( file ( append create getattr ioctl lock map open read rename setattr unlink write )))
+    (allow process container_var_run_t ( fifo_file ( getattr read write append ioctl lock open )))
+    (allow process container_var_run_t ( sock_file ( ioctl append getattr open read write )))
+    (allow process container_var_run_t ( lnk_file (  ioctl lock append getattr open read write )))
+)

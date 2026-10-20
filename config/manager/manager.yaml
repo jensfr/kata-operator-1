@@ -108,6 +108,10 @@ spec:
               value: registry.redhat.io/openshift-sandboxed-containers/osc-must-gather-rhel9@sha256:b7880e13f26b2a511920017ff126d992f3b7f05b031ec98061a0c65c8b5a208c
             - name: RELATED_IMAGE_STORAGE_HELPER
               value: registry.redhat.io/openshift-sandboxed-containers/osc-storage-helper@sha256:557b31368c24a06345a1d45298af6b61e46426cbfe3db7d2c3093822ff9617fe
+            - name: RELATED_IMAGE_KATA_DEPLOY
+              value: quay.io/openshift_sandboxed_containers/osc-kata-deploy:latest
+            - name: RELATED_IMAGE_OSC_HELPER
+              value: registry.access.redhat.com/ubi9/ubi:latest
           imagePullPolicy: Always
           resources:
             limits:
